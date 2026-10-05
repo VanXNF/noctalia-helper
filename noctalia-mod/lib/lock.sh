@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # A non-blocking project lock prevents concurrent state writes and swaps.
 
 with_project_lock() {

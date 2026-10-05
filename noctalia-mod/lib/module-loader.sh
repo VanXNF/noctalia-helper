@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Module metadata is Bash deliberately: it keeps the new runtime dependency-free
 # and only lives in this repository, never in user-writable configuration paths.
 
@@ -10,9 +11,16 @@ MODULE_PRESERVE=()
 MODULE_CHMOD=()
 MODULE_RELOAD_COMMAND=()
 MODULE_VALIDATE_PATHS=()
+MODULE_EXTERNAL_REFS=()
+MODULE_REQUIRED_COMMANDS=()
+MODULE_OPTIONAL_COMMANDS=()
+MODULE_EXTERNAL_COMMANDS=()
 MODULE_PARTS=()
 MODULE_PRESET_DEFAULT='default'
 
+# 这些变量是模块协议的一部分：本文件只声明与重置，读取方在 deploy.sh / bin 里。
+# 单文件静态分析看不到那些读取点，所以这里关掉 SC2034。
+# shellcheck disable=SC2034
 module_reset() {
     MODULE_ID=''
     MODULE_TARGET=''
@@ -23,12 +31,16 @@ module_reset() {
     MODULE_CHMOD=()
     MODULE_RELOAD_COMMAND=()
     MODULE_VALIDATE_PATHS=()
+    MODULE_EXTERNAL_REFS=()
+    MODULE_REQUIRED_COMMANDS=()
+    MODULE_OPTIONAL_COMMANDS=()
+    MODULE_EXTERNAL_COMMANDS=()
     MODULE_PARTS=()
     MODULE_PRESET_DEFAULT='default'
 }
 
 module_load() {
-    local requested=$1 root conf package path part variable
+    local requested=$1 root conf package path part variable command_entry
     is_safe_identifier "$requested" || {
         error "invalid module id: $requested"
         return 1
@@ -60,7 +72,29 @@ module_load() {
             return 1
         }
     done
-    for path in "${MODULE_PRESERVE[@]}" "${MODULE_VALIDATE_PATHS[@]}"; do
+    # 必需程序必须写成 命令:包 —— 没有包就没法装，那样的声明没有意义。
+    for command_entry in "${MODULE_REQUIRED_COMMANDS[@]}"; do
+        if [[ $command_entry != *:* ]] ||
+            ! is_safe_command_name "${command_entry%%:*}" ||
+            ! is_safe_package_name "${command_entry#*:}"; then
+            error "invalid required command in module $requested: $command_entry (expect command:package)"
+            return 1
+        fi
+    done
+    for command_entry in "${MODULE_OPTIONAL_COMMANDS[@]}"; do
+        [[ $command_entry == *:* ]] && command_entry=${command_entry%%:*}
+        is_safe_command_name "$command_entry" || {
+            error "invalid optional command in module $requested: $command_entry"
+            return 1
+        }
+    done
+    for command_entry in "${MODULE_EXTERNAL_COMMANDS[@]}"; do
+        is_safe_command_name "$command_entry" || {
+            error "invalid external command in module $requested: $command_entry"
+            return 1
+        }
+    done
+    for path in "${MODULE_PRESERVE[@]}" "${MODULE_VALIDATE_PATHS[@]}" "${MODULE_EXTERNAL_REFS[@]}"; do
         is_safe_relative_path "$path" || {
             error "invalid relative path in module $requested: $path"
             return 1
@@ -78,10 +112,10 @@ module_load() {
             return 1
         }
         variable="MODULE_PART_${part^^}_TARGET"
-        [[ -n ${!variable:-} ]] && is_safe_relative_path "${!variable}" || {
+        if [[ -z ${!variable:-} ]] || ! is_safe_relative_path "${!variable}"; then
             error "part $part in module $requested has no valid target"
             return 1
-        }
+        fi
         [[ -d $root/parts/$part ]] || {
             error "part $part in module $requested has no source directory"
             return 1

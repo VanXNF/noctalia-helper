@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Deployment transaction: stage the final tree first, then atomically exchange it.
 
 copy_item_preserving_links() {
@@ -143,6 +144,51 @@ module_validate_deployment() {
             return 1
         }
     done
+}
+
+# 部署指纹（PLAN §1）：只覆盖"本项目会覆盖的文件"，即排除 __custom__ 与
+# MODULE_PRESERVE。用户改 __custom__ 是设计内行为，不算漂移；运行时被改写的
+# 文件必须声明为 preserve，否则报漂移就是对的——它说明模块元数据漏了一个
+# 运行时写入者。权限位不进指纹：apply_chmod_rules 每次部署都会重新施加。
+module_fingerprint_stream() {
+    local target=$1 path relative preserve skip
+    [[ -e $target || -L $target ]] || return 0
+    if [[ -L $target ]]; then
+        printf 'link\0%s\0' "$(readlink "$target")"
+        return 0
+    fi
+    if [[ -f $target ]]; then
+        printf 'file\0'
+        sha256sum < "$target" | cut -d' ' -f1
+        printf '\0'
+        return 0
+    fi
+    while IFS= read -r -d '' path; do
+        relative=${path#"$target"/}
+        case $relative in
+            *__custom__*) continue ;;
+        esac
+        skip=''
+        for preserve in "${MODULE_PRESERVE[@]}"; do
+            [[ $relative == "$preserve" ]] && {
+                skip=yes
+                break
+            }
+        done
+        [[ -n $skip ]] && continue
+        printf '%s\0' "$relative"
+        if [[ -L $path ]]; then
+            printf 'link\0%s\0' "$(readlink "$path")"
+        else
+            sha256sum < "$path" | cut -d' ' -f1
+            printf '\0'
+        fi
+    done < <(find "$target" \( -type f -o -type l \) -print0 | LC_ALL=C sort -z)
+}
+
+module_fingerprint() {
+    local target=$1
+    module_fingerprint_stream "$target" | sha256sum | cut -d' ' -f1
 }
 
 module_reload() {

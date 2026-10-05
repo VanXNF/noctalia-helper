@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # XDG locations and target path checks.
 
 project_root() {
@@ -18,14 +19,6 @@ state_root() {
 
 cache_root() {
     printf '%s\n' "${XDG_CACHE_HOME:-$(home_dir)/.cache}/noctalia-mod"
-}
-
-runtime_root() {
-    if [[ -n ${XDG_RUNTIME_DIR:-} && -d ${XDG_RUNTIME_DIR} && -w ${XDG_RUNTIME_DIR} ]]; then
-        printf '%s/noctalia-mod\n' "$XDG_RUNTIME_DIR"
-    else
-        printf '%s/noctalia-mod\n' "$(cache_root)/runtime"
-    fi
 }
 
 module_root() {

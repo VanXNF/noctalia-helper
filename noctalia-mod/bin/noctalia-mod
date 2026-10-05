@@ -1,23 +1,38 @@
 #!/usr/bin/env bash
+# 被 source 的 lib 用相对路径解析：相对本脚本所在目录，而不是调用者的 cwd。
+# shellcheck source-path=SCRIPTDIR
 set -euo pipefail
 
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-export NOCTALIA_MOD_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
+NOCTALIA_MOD_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P) || exit 1
+export NOCTALIA_MOD_ROOT
 
 # shellcheck source=../lib/common.sh
 source "$NOCTALIA_MOD_ROOT/lib/common.sh"
+# shellcheck source=../lib/paths.sh
 source "$NOCTALIA_MOD_ROOT/lib/paths.sh"
+# shellcheck source=../lib/lock.sh
 source "$NOCTALIA_MOD_ROOT/lib/lock.sh"
+# shellcheck source=../lib/state.sh
 source "$NOCTALIA_MOD_ROOT/lib/state.sh"
+# shellcheck source=../lib/module-loader.sh
 source "$NOCTALIA_MOD_ROOT/lib/module-loader.sh"
+# shellcheck source=../lib/package-manager.sh
 source "$NOCTALIA_MOD_ROOT/lib/package-manager.sh"
+# shellcheck source=../lib/deploy.sh
 source "$NOCTALIA_MOD_ROOT/lib/deploy.sh"
+# shellcheck source=../lib/snapshot.sh
 source "$NOCTALIA_MOD_ROOT/lib/snapshot.sh"
+# shellcheck source=../lib/reference-check.sh
+source "$NOCTALIA_MOD_ROOT/lib/reference-check.sh"
 
 usage() {
     cat <<'USAGE'
 Usage:
   noctalia-mod list
+  noctalia-mod check
+  noctalia-mod setup [module ...] [--yes] [--with <program> ...]
+  noctalia-mod deps [module ...] [--yes]
   noctalia-mod plan [module ...]
   noctalia-mod install [module ...] [--yes]
   noctalia-mod preset <module> list|apply <name> [--yes]
@@ -43,16 +58,6 @@ resolve_modules() {
     RESOLVED_MODULES=("${requested[@]}")
 }
 
-environment_summary() {
-    if [[ -f /etc/cachyos-release ]]; then
-        printf 'environment\tCachyOS detected\n'
-    else
-        printf 'environment\tCachyOS marker not found (first-stage target only)\n'
-    fi
-    command -v niri >/dev/null 2>&1 || printf 'environment\tniri is not currently on PATH\n'
-    command -v noctalia >/dev/null 2>&1 || printf 'environment\tNoctalia is not currently on PATH\n'
-}
-
 collect_packages() {
     local id package
     PLAN_REPO_PACKAGES=()
@@ -69,14 +74,51 @@ collect_packages() {
 }
 
 print_plan() {
-    local -a modules=("$@") missing_repo=() missing_aur=()
-    local id target owner preserve
+    local -a modules=("$@")
     collect_packages "${modules[@]}"
-    mapfile -t missing_repo < <(package_missing "${PLAN_REPO_PACKAGES[@]}")
-    mapfile -t missing_aur < <(package_missing "${PLAN_AUR_PACKAGES[@]}")
     printf 'Noctalia Mod pre-flight\n'
     environment_summary
-    for id in "${modules[@]}"; do
+    print_module_lines "${modules[@]}"
+    print_missing_packages
+    local unresolved
+    unresolved=$(reference_check_unresolved) || true
+    [[ -n $unresolved ]] && printf '%s\n' "$unresolved" | sed 's/^/unresolved-ref\t/'
+    print_runtime_commands "${modules[@]}"
+    return 0
+}
+
+# 预检行的拼装件：plan / deps / setup 共用，差别只在头部、可选菜单与确认时机。
+
+# 这份清单声明了哪些包，以及此刻还差哪些。
+print_declared_packages() {
+    ((${#PLAN_REPO_PACKAGES[@]})) && printf 'repo\t%s\n' "$(join_by ' ' "${PLAN_REPO_PACKAGES[@]}")"
+    ((${#PLAN_AUR_PACKAGES[@]})) && printf 'aur\t%s\n' "$(join_by ' ' "${PLAN_AUR_PACKAGES[@]}")"
+    return 0
+}
+
+print_missing_packages() {
+    local -a missing_repo=() missing_aur=()
+    mapfile -t missing_repo < <(package_missing "${PLAN_REPO_PACKAGES[@]}")
+    mapfile -t missing_aur < <(package_missing "${PLAN_AUR_PACKAGES[@]}")
+    ((${#missing_repo[@]})) && printf 'missing-repo\t%s\n' "$(join_by ' ' "${missing_repo[@]}")"
+    ((${#missing_aur[@]})) && printf 'missing-aur\t%s\n' "$(join_by ' ' "${missing_aur[@]}")"
+    return 0
+}
+
+# AUR helper 只在真有 AUR 包要装时才谈：没 helper 就装不了，提前说出来。
+print_aur_helper_if_needed() {
+    local -a missing_aur=()
+    local helper
+    mapfile -t missing_aur < <(package_missing "${PLAN_AUR_PACKAGES[@]}")
+    ((${#missing_aur[@]})) || return 0
+    helper=$(package_aur_helper 2>/dev/null) || helper='none'
+    printf 'aur-helper\t%s\n' "$helper"
+}
+
+# 配置部署清单（PLAN §5 第 4 步）：会覆盖什么、保留什么、reload 什么、有没有漂移。
+print_module_lines() {
+    local id target owner preserve recorded_fingerprint
+    for id in "$@"; do
         module_load "$id"
         target=$(safe_target_path "$MODULE_TARGET")
         owner=external
@@ -87,32 +129,158 @@ print_plan() {
         done
         [[ -e $target || -L $target ]] && printf 'overwrite\t%s\t%s\n' "$id" "$target"
         ((${#MODULE_RELOAD_COMMAND[@]})) && printf 'reload\t%s\t%s\n' "$id" "$(join_by ' ' "${MODULE_RELOAD_COMMAND[@]}")"
+        # 漂移：目标被本项目之外的东西改过（PLAN §1）。指纹只覆盖会覆盖的文件。
+        recorded_fingerprint=$(module_state_get "$id" fingerprint 2>/dev/null || true)
+        if [[ -n $recorded_fingerprint ]]; then
+            if [[ ! -e $target && ! -L $target ]]; then
+                printf 'drift\t%s\tmissing\n' "$id"
+            elif [[ $(module_fingerprint "$target") != "$recorded_fingerprint" ]]; then
+                printf 'drift\t%s\tchanged\n' "$id"
+            fi
+        fi
     done
-    ((${#missing_repo[@]})) && printf 'missing-repo\t%s\n' "$(join_by ' ' "${missing_repo[@]}")"
-    ((${#missing_aur[@]})) && printf 'missing-aur\t%s\n' "$(join_by ' ' "${missing_aur[@]}")"
+    return 0
+}
+
+# 依赖阶段的独立预检：只讲软件包与程序，不掺配置内容（PLAN §7）。
+print_dependency_plan() {
+    local -a modules=("$@")
+    collect_packages "${modules[@]}"
+    printf 'Noctalia Mod dependency pre-flight\n'
+    environment_summary
+    print_declared_packages
+    print_missing_packages
+    print_aur_helper_if_needed
+    print_runtime_commands "${modules[@]}"
+    return 0
+}
+
+# setup 的合并预检：依赖与配置一次性摊开，确认一次，然后安静跑完（PLAN §0）。
+# 可选项排在这里是它的唯一去处——默认不装，要装得在命令行上说 --with。
+print_setup_plan() {
+    local -a modules=("$@")
+    printf 'Noctalia Mod setup\n'
+    environment_summary
+    printf 'modules\t%s\n' "$(join_by ' ' "${modules[@]}")"
+    print_declared_packages
+    print_missing_packages
+    print_aur_helper_if_needed
+    print_optional_programs "${modules[@]}"
+    print_module_lines "${modules[@]}"
+    print_missing_required_commands "${modules[@]}"
+    return 0
+}
+
+# 悬空引用 / 未声明程序都是仓库缺陷，不是用户选择：部署前硬性拦下（PLAN §3）。
+require_consistent_references() {
+    local unresolved undeclared unbound failed=0
+    unresolved=$(reference_check_unresolved) || true
+    undeclared=$(command_check_undeclared) || true
+    unbound=$(command_check_unbound) || true
+    if [[ -n $unresolved ]]; then
+        printf '%s\n' "$unresolved" | sed 's/^/unresolved-ref\t/'
+        failed=1
+    fi
+    if [[ -n $undeclared ]]; then
+        printf '%s\n' "$undeclared" | sed 's/^/undeclared-command\t/'
+        failed=1
+    fi
+    if [[ -n $unbound ]]; then
+        printf '%s\n' "$unbound" | sed 's/^/unbound-command\t/'
+        failed=1
+    fi
+    ((failed)) || return 0
+    error 'refusing to deploy: module sources have unresolved references or undeclared programs'
+    return 1
+}
+
+# 运行时程序报告：包装完了不等于命令真的在 PATH 上（PLAN §10 P1-6）。
+print_runtime_commands() {
+    local module command package kind
+    while IFS=$'\t' read -r module command package kind; do
+        printf 'missing-%s\t%s\t%s\t%s\n' "$kind" "$module" "$command" "$package"
+    done < <(runtime_command_report "$@")
+    return 0
+}
+
+# setup 只要必需项：可选项在它自己那份 --with 菜单里已经列过一次了。
+print_missing_required_commands() {
+    local module command package kind
+    while IFS=$'\t' read -r module command package kind; do
+        [[ $kind == required ]] || continue
+        printf 'missing-required\t%s\t%s\t%s\n' "$module" "$command" "$package"
+    done < <(runtime_command_report "$@")
+    return 0
+}
+
+# setup 的可选菜单：只列这台机器上还没有的声明项，--with 认的就是这些名字。
+print_optional_programs() {
+    local module command package state
+    while IFS=$'\t' read -r module command package state; do
+        [[ $state == missing ]] || continue
+        printf 'optional\t%s\t%s\t%s\n' "$module" "$command" "$package"
+    done < <(package_optional_catalog "$@")
+    return 0
+}
+
+# --with 收集到的可选程序名。命令行不能绕过"谁 spawn 谁声明"的契约（PLAN §3），
+# 所以只能点名模块声明过的可选程序，再由这里解析成包。
+PLAN_OPTIONAL_PROGRAMS=()
+
+# 解析出的包并进 PLAN_REPO_PACKAGES / PLAN_AUR_PACKAGES，于是预检、安装、记账
+# 走的是同一条路径，不额外开一条装包通道。
+resolve_optional_programs() {
+    local -a modules=("$@") catalog=() available=()
+    ((${#PLAN_OPTIONAL_PROGRAMS[@]})) || return 0
+    mapfile -t catalog < <(package_optional_catalog "${modules[@]}")
+    local line requested id command package state matched
+    for requested in "${PLAN_OPTIONAL_PROGRAMS[@]}"; do
+        is_safe_command_name "$requested" || {
+            error "invalid optional program: $requested"
+            return 1
+        }
+        matched=''
+        for line in "${catalog[@]}"; do
+            IFS=$'\t' read -r id command package state <<< "$line"
+            [[ $command == "$requested" ]] || continue
+            matched=yes
+            [[ $package != '-' ]] || {
+                error "--with $requested: no package is declared for it, nothing to install"
+                return 1
+            }
+            if [[ $(package_source_for "$package" "${modules[@]}") == aur ]]; then
+                contains_word "$package" "${PLAN_AUR_PACKAGES[@]}" || PLAN_AUR_PACKAGES+=("$package")
+            else
+                contains_word "$package" "${PLAN_REPO_PACKAGES[@]}" || PLAN_REPO_PACKAGES+=("$package")
+            fi
+        done
+        [[ -n $matched ]] && continue
+        available=()
+        for line in "${catalog[@]}"; do
+            IFS=$'\t' read -r id command package state <<< "$line"
+            contains_word "$command" "${available[@]}" || available+=("$command")
+        done
+        error "--with $requested: not a declared optional program in the selected modules"
+        ((${#available[@]})) && printf 'available: %s\n' "$(join_by ' ' "${available[@]}")" >&2
+        return 1
+    done
     return 0
 }
 
 confirm_plan() {
-    local yes=$1
+    local yes=$1 prompt=${2-'Apply this plan?'}
     [[ $yes == yes ]] && return 0
     [[ -t 0 ]] || {
-        error 'refusing a non-interactive install without --yes'
+        error "refusing a non-interactive run without --yes"
         return 1
     }
     local answer
-    read -r -p 'Apply this plan? [y/N] ' answer
+    read -r -p "$prompt [y/N] " answer
     [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]]
 }
 
-install_dependencies() {
-    local -a missing_repo=() missing_aur=()
-    mapfile -t missing_repo < <(package_missing "${PLAN_REPO_PACKAGES[@]}")
-    mapfile -t missing_aur < <(package_missing "${PLAN_AUR_PACKAGES[@]}")
-    ((${#missing_repo[@]})) && package_install repo yes "${missing_repo[@]}"
-    ((${#missing_aur[@]})) && package_install aur yes "${missing_aur[@]}"
-    return 0
-}
+# AUR helper 在动手之前就要确认，避免 repo 包装完了才卡在 AUR 上。
+# 依赖阶段本身住在 lib/package-manager.sh（见 §7），这里只做编排。
 
 record_modules() {
     local snapshot=$1
@@ -130,6 +298,8 @@ record_modules() {
             [[ -n $selected ]] || selected=$(module_part_default "$part")
             part_pairs+=("part.$part" "$selected")
         done
+        # 合并写入会保留没提到的键，所以模块删掉的零件插槽要在这里显式清掉。
+        state_module_unset_prefix "$id" 'part.'
         module_state_write "$id" \
             enabled 1 \
             preset "$(module_state_get "$id" preset 2>/dev/null || printf '%s' "$MODULE_PRESET_DEFAULT")" \
@@ -139,8 +309,20 @@ record_modules() {
             custom_paths "$custom_paths" \
             preserve_paths "$preserve_paths" \
             last_result success \
+            fingerprint "$(module_fingerprint "$target")" \
             "${part_pairs[@]}"
     done
+}
+
+# 只记我们装下去的包；本来就装着的包不算我们的账（PLAN §7）。
+record_installed_packages() {
+    if ((${#PLAN_INSTALLED_REPO[@]})); then
+        state_record_installed_packages repo "${PLAN_INSTALLED_REPO[@]}"
+    fi
+    if ((${#PLAN_INSTALLED_AUR[@]})); then
+        state_record_installed_packages aur "${PLAN_INSTALLED_AUR[@]}"
+    fi
+    return 0
 }
 
 cmd_list() {
@@ -150,6 +332,59 @@ cmd_list() {
         module_load "$id"
         printf '%s\t%s\n' "$id" "$MODULE_TARGET"
     done < <(module_ids)
+}
+
+cmd_deps() {
+    local yes=no arg
+    local -a requested=() modules=() missing_repo=() missing_aur=()
+    while (($#)); do
+        arg=$1
+        shift
+        case $arg in
+            --yes|--express) yes=yes ;;
+            -*) error "unknown deps option: $arg"; return 2 ;;
+            *) requested+=("$arg") ;;
+        esac
+    done
+    resolve_modules "${requested[@]}" || return 1
+    modules=("${RESOLVED_MODULES[@]}")
+    print_dependency_plan "${modules[@]}"
+    collect_packages "${modules[@]}"
+    mapfile -t missing_repo < <(package_missing "${PLAN_REPO_PACKAGES[@]}")
+    mapfile -t missing_aur < <(package_missing "${PLAN_AUR_PACKAGES[@]}")
+    if ((${#missing_repo[@]} == 0 && ${#missing_aur[@]} == 0)); then
+        log 'nothing to install'
+        return 0
+    fi
+    confirm_plan "$yes" 'Install these packages?' || return 1
+    install_dependencies || return 1
+    record_installed_packages
+    state_append_audit deps "$(join_by ',' "${modules[@]}")"
+    log 'dependencies installed'
+    # 包都装了不等于命令就在 PATH 上：再核一遍必需程序，别让用户到快捷键上才发现。
+    local module command package kind
+    while IFS=$'\t' read -r module command package kind; do
+        [[ $kind == required ]] || continue
+        warn "still missing after install: $command (package $package, module $module)"
+    done < <(runtime_command_report "${modules[@]}")
+}
+
+cmd_check() {
+    [[ $# -eq 0 ]] || { error 'check does not accept extra arguments'; return 2; }
+    local unresolved undeclared unbound
+    unresolved=$(reference_check_unresolved) || true
+    undeclared=$(command_check_undeclared) || true
+    unbound=$(command_check_unbound) || true
+    if [[ -z $unresolved && -z $undeclared && -z $unbound ]]; then
+        log 'reference check: every module reference and program declaration resolves'
+        return 0
+    fi
+    printf 'kind\tmodule\titem\n'
+    [[ -n $unresolved ]] && printf '%s\n' "$unresolved" | sed 's/^/unresolved-ref\t/'
+    [[ -n $undeclared ]] && printf '%s\n' "$undeclared" | sed 's/^/undeclared-command\t/'
+    [[ -n $unbound ]] && printf '%s\n' "$unbound" | sed 's/^/unbound-command\t/'
+    error 'declare the path in MODULE_EXTERNAL_REFS, or declare the program in MODULE_REQUIRED/OPTIONAL/EXTERNAL_COMMANDS'
+    return 1
 }
 
 cmd_plan() {
@@ -179,9 +414,11 @@ cmd_install() {
     done
     resolve_modules "${requested[@]}" || return 1
     modules=("${RESOLVED_MODULES[@]}")
+    require_consistent_references || return 1
     print_plan "${modules[@]}"
     confirm_plan "$yes" || return 1
     install_dependencies || return 1
+    record_installed_packages
     local snapshot id
     snapshot=$(snapshot_create auto "before install: $(join_by ',' "${modules[@]}")" "${modules[@]}") || return 1
     for id in "${modules[@]}"; do
@@ -194,6 +431,92 @@ cmd_install() {
     record_modules "$snapshot" "${modules[@]}"
     state_append_audit install "$(join_by ',' "${modules[@]}")"
     log "installed: $(join_by ', ' "${modules[@]}")"
+}
+
+# 初始化核心集：配置能真正跑起来的最小集合（PLAN §11 阶段 B）。niri 的默认配置
+# spawn 的 kitty、nautilus、wpctl、notify-send 由 niri 自己的包清单带上，所以这里
+# 只点名两个模块。其余三个是加固，要就得显式提名——无参数不等于"全都要"。
+setup_default_modules() {
+    printf 'niri\nnoctalia\n'
+}
+
+# 收尾总结：本次做了什么、配置落到哪、下一步与退路（PLAN §11 阶段 B）。
+print_setup_summary() {
+    local -a modules=("$@")
+    local id target
+    printf 'setup complete\n'
+    if ((${#PLAN_INSTALLED_REPO[@]} || ${#PLAN_INSTALLED_AUR[@]})); then
+        printf 'installed\t%s\n' \
+            "$(join_by ' ' "${PLAN_INSTALLED_REPO[@]}" "${PLAN_INSTALLED_AUR[@]}")"
+    else
+        printf 'installed\tnothing (every package was already present)\n'
+    fi
+    for id in "${modules[@]}"; do
+        module_load "$id"
+        target=$(safe_target_path "$MODULE_TARGET")
+        printf 'deployed\t%s\t%s\n' "$id" "$target"
+    done
+    printf 'next\tstart a niri session, or reload one already running, to pick it up\n'
+    printf 'undo\tnoctalia-mod rollback\n'
+    return 0
+}
+
+# 两段式的引导路径：依赖与配置一次摊开、确认一次、然后安静跑完（PLAN §0）。
+# 不是 deps 套 install —— 那样会问两次、打印两份清单，也就不是"集中决策"了。
+cmd_setup() {
+    local yes=no arg
+    local -a requested=() modules=() missing_repo=() missing_aur=()
+    PLAN_OPTIONAL_PROGRAMS=()
+    while (($#)); do
+        arg=$1
+        shift
+        case $arg in
+            --yes|--express) yes=yes ;;
+            --with)
+                [[ $# -ge 1 ]] || { error '--with requires a program name'; return 2; }
+                PLAN_OPTIONAL_PROGRAMS+=("$1")
+                shift
+                ;;
+            -*) error "unknown setup option: $arg"; return 2 ;;
+            *) requested+=("$arg") ;;
+        esac
+    done
+    if ((${#requested[@]} == 0)); then
+        mapfile -t requested < <(setup_default_modules)
+    fi
+    resolve_modules "${requested[@]}" || return 1
+    modules=("${RESOLVED_MODULES[@]}")
+    # 仓库缺陷先拦下：引用悬空或程序没人声明时，装下去也是坏的（PLAN §3）。
+    require_consistent_references || return 1
+    collect_packages "${modules[@]}"
+    resolve_optional_programs "${modules[@]}" || return 1
+    print_setup_plan "${modules[@]}"
+    mapfile -t missing_repo < <(package_missing "${PLAN_REPO_PACKAGES[@]}")
+    mapfile -t missing_aur < <(package_missing "${PLAN_AUR_PACKAGES[@]}")
+    if ((${#missing_repo[@]} || ${#missing_aur[@]})); then
+        confirm_plan "$yes" 'Install these packages and deploy the configuration?' || return 1
+    else
+        confirm_plan "$yes" 'Deploy the configuration?' || return 1
+    fi
+    install_dependencies || return 1
+    record_installed_packages
+    if ((${#PLAN_INSTALLED_REPO[@]} || ${#PLAN_INSTALLED_AUR[@]})); then
+        state_append_audit deps "$(join_by ',' "${modules[@]}")"
+    else
+        log 'nothing to install'
+    fi
+    local snapshot id
+    snapshot=$(snapshot_create auto "before setup: $(join_by ',' "${modules[@]}")" "${modules[@]}") || return 1
+    for id in "${modules[@]}"; do
+        if ! module_deploy "$id"; then
+            error "deployment failed for $id; restoring $snapshot"
+            snapshot_restore "$snapshot" no "${modules[@]}" || error 'automatic restore failed; inspect the snapshot before retrying'
+            return 1
+        fi
+    done
+    record_modules "$snapshot" "${modules[@]}"
+    state_append_audit setup "$(join_by ',' "${modules[@]}")"
+    print_setup_summary "${modules[@]}"
 }
 
 cmd_preset() {
@@ -212,7 +535,12 @@ cmd_preset() {
             [[ -n $name ]] || { error 'preset apply requires a preset name'; return 2; }
             shift 3
             for option in "$@"; do
-                [[ $option == --yes || $option == --express ]] && yes=yes || { error "unknown preset option: $option"; return 2; }
+                if [[ $option == --yes || $option == --express ]]; then
+                    yes=yes
+                else
+                    error "unknown preset option: $option"
+                    return 2
+                fi
             done
             module_load "$id"
             module_source_for_preset "$(module_root "$id")" "$name" >/dev/null || { error "unknown preset: $name"; return 1; }
@@ -252,7 +580,12 @@ cmd_part() {
             [[ -n $name ]] || { error 'part apply requires a part name'; return 2; }
             shift 4
             for option in "$@"; do
-                [[ $option == --yes || $option == --express ]] && yes=yes || { error "unknown part option: $option"; return 2; }
+                if [[ $option == --yes || $option == --express ]]; then
+                    yes=yes
+                else
+                    error "unknown part option: $option"
+                    return 2
+                fi
             done
             module_source_for_part "$(module_root "$id")" "$slot" "$name" >/dev/null || { error "unknown $slot part: $name"; return 1; }
             local old_part part_was_set=no
@@ -343,6 +676,13 @@ cmd_uninstall() {
         if [[ -n $snapshot ]] && snapshot_exists "$snapshot"; then
             snapshot_restore "$snapshot" no "$id"
         else
+            # 回滚点没了就只能删自己铺的文件，用户原来的配置恢复不了——必须说出来，
+            # 不能让它静悄悄地发生（PLAN §6）。
+            if [[ -n $snapshot ]]; then
+                warn "recovery snapshot $snapshot for $id is gone; original files cannot be restored"
+            else
+                warn "no recovery snapshot recorded for $id; original files cannot be restored"
+            fi
             module_clear_managed_config "$id"
         fi
         module_state_remove "$id"
@@ -370,6 +710,9 @@ main() {
     shift || true
     case $command in
         list) cmd_list "$@" ;;
+        check) cmd_check "$@" ;;
+        setup) with_project_lock cmd_setup "$@" ;;
+        deps) with_project_lock cmd_deps "$@" ;;
         plan) cmd_plan "$@" ;;
         install) with_project_lock cmd_install "$@" ;;
         preset) with_project_lock cmd_preset "$@" ;;
