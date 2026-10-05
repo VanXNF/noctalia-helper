@@ -1,0 +1,26 @@
+// Niri Material You Dynamic Colors (rendered by Noctalia based on wallpaper palette)
+layout {
+    focus-ring {
+        width 2
+        active-color "#b6c7e7"
+        inactive-color "transparent"
+        urgent-color "#ffb4ab"
+    }
+    shadow {
+        on
+        softness 28
+        spread 6
+        offset x=0 y=0
+        draw-behind-window false
+        color "#b6c7e795"
+        inactive-color "#00000045"
+    }
+    tab-indicator {
+        active-color "#b6c7e7"
+        inactive-color "#374761"
+        urgent-color "#ffb4ab"
+    }
+    insert-hint {
+        color "#b6c7e780"
+    }
+}

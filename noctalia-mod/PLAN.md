@@ -1,16 +1,17 @@
 # Noctalia Mod：模块化脚本项目重构计划
 
 > 这是后续分步实施的事实入口和会话交接文档。
-> 当前只保存方案，不实现模块代码，不修改旧 Nyxuri 行为。
+> 第一阶段骨架、部署核心、状态快照和五个模块已经在本目录落地；现有配置管理器
+> 行为仍保持不变。本文继续作为后续验收和会话交接方案。
 
 ## 1. 当前调查结论
 
-当前仓库的 Nyxuri 已经具备较完整的配置部署能力，但安装入口、配置部署、依赖管理、状态、预设、主题和运行时脚本仍由 Python 中央路由连接，模块之间存在跨域依赖。
+当前仓库的现有配置管理器已经具备较完整的配置部署能力，但安装入口、配置部署、依赖管理、状态、预设、主题和运行时脚本仍由 Python 中央路由连接，模块之间存在跨域依赖。
 
 已确认的现状：
 
 - `install.sh` 负责引导、缓存仓库、网络镜像和进入 Python 引擎。
-- `nyxuri/` 是当前主运行时，使用 Python 标准库实现。
+- 现有 Python 引擎目录是当前主运行时，使用 Python 标准库实现。
 - `configs/` 保存 niri、Noctalia、Fish、Kitty 等配置源码。
 - `assets/` 保存壁纸、Fcitx5 等静态资产。
 - 当前已有原子部署、`__custom__` 保留、manifest preserve、预设、零件、快照、回滚、卸载和状态账本能力。
@@ -22,11 +23,11 @@
 - Noctalia、niri 仍在多个位置作为默认或特殊对象出现。
 - Noctalia、niri 运行时脚本仍会直接读取 `~/.config/niri`、`~/.config/noctalia`、`~/.local/state` 和 `~/.cache`。
 
-调查时以当前源码行为为准，`llms-wiki/` 作为架构契约和设计决策参考。若源码与 Wiki 不一致，实施时必须先记录差异，再决定是否修正文档或保留兼容行为。
+调查时以当前源码行为为准；若源码与已有项目文档不一致，实施时必须先记录差异，再决定是否修正文档或保留兼容行为。
 
 ## 2. 总体目标与边界
 
-新项目在当前仓库内与旧 Nyxuri 并行存在，项目目录固定为：
+新项目在当前仓库内独立存在，项目目录固定为：
 
 ```text
 noctalia-mod/
@@ -51,7 +52,19 @@ noctalia-mod/
 - 快照、回滚和卸载。
 - 隔离环境测试和新旧行为对照。
 
-第一阶段不替换 `install.sh`，不删除或重构旧 Nyxuri，不迁移旧 Nyxuri 状态。
+第一阶段不替换 `install.sh`，不删除或重构现有配置管理器，不迁移现有配置管理器状态。
+
+### 第一阶段已实现
+
+当前第一阶段已经在 `noctalia-mod/` 内完成，代码和文档保持自包含：
+
+- Bash 入口和模块加载器已经接入 `niri`、`noctalia`、`kitty`、`fish`、`starship` 五个模块。
+- 已实现 `list`、`plan`、`install --yes`、`preset`、`part`、`snapshot`、`rollback`、`uninstall` 和 `status` 等操作。
+- 已实现依赖检查、pacman/AUR helper 参数构造、pre-flight 清单、原子部署、失败恢复、锁和状态账本。
+- 已实现自动快照、手动快照、回滚、卸载恢复，以及 `__custom__` 和模块 preserve 路径保留。
+- Fish 模块只保留通用配置、local PATH hook 和 `noctalia-mod` completion，不再携带旧配置管理器的 helper、别名、补全或状态桥接。
+- 并行项目不读取旧状态、不依赖旧入口，也不在 `noctalia-mod/` 内保留旧项目品牌和兼容命名；相关文档只维护在本目录，不同步到 `llms-wiki/`。
+- 行为测试、Shell 语法检查和隔离环境验收已加入当前提交范围。
 
 ## 3. 目标目录结构
 
@@ -252,7 +265,7 @@ $XDG_RUNTIME_DIR/noctalia-mod/
 
 ## 9. 第一批模块
 
-第一阶段只迁移以下五个核心模块：
+第一阶段已接入以下五个核心模块：
 
 - `niri`
 - `noctalia`
@@ -263,22 +276,22 @@ $XDG_RUNTIME_DIR/noctalia-mod/
 迁移重点：
 
 - niri：默认配置、monitor preserve、effects/glow parts、脚本权限和安全部署。
-- noctalia：Noctalia V5 配置和必要模板，不迁移主题同步、壁纸 hook 或运行时工具。
+- noctalia：Noctalia V5 配置和必要模板；本项目不额外维护主题同步、壁纸 hook 或运行时工具的独立管理流程。
 - kitty：配置和必要 reload。
 - fish：配置目录和自定义文件保留。
 - starship：单文件配置和最小状态处理。
 
 后续再按同一协议迁移 `fastfetch`、`xdg-desktop-portal`、`zed` 等模块。
 
-## 10. 与旧 Nyxuri 的关系
+## 10. 与现有配置管理器的关系
 
-新旧项目并行存在：
+本项目与现有配置管理器并行存在：
 
 - 不修改现有 `install.sh`。
 - 不让旧入口自动切换到 `noctalia-mod`。
-- 不读取或迁移 `~/.config/nyxuri` 中的 active preset、快照索引和账本。
+- 不读取或迁移现有配置管理器的 active preset、快照索引和账本。
 - 现有 `~/.config/niri`、`~/.config/noctalia` 可以被识别为外部配置并在 pre-flight 中提示冲突。
-- 新项目稳定前，旧 Nyxuri 继续作为行为参考和回退路径。
+- 新项目稳定前，现有配置管理器继续作为行为参考和回退路径。
 - 新旧部署结果在隔离 HOME 中对照验收后，再决定是否增加 opt-in 接入。
 
 ## 11. 暂不实现的内容
@@ -292,7 +305,7 @@ $XDG_RUNTIME_DIR/noctalia-mod/
 - Noctalia IPC/CLI 封装。
 - Fcitx5、greeter、GTK 主题迁移。
 - Python 与 Bash 混合运行时。
-- 旧 Nyxuri 状态迁移。
+- 现有配置管理器状态迁移。
 - 自动安装 AUR helper。
 - 系统软件包自动卸载。
 - 跨发行版兼容承诺。
@@ -302,14 +315,16 @@ $XDG_RUNTIME_DIR/noctalia-mod/
 
 ## 12. 分步实施顺序
 
-### 第 0 步：骨架与契约
+以下步骤均已完成；后续新增模块仍沿用同一顺序。
+
+### 第 0 步：骨架与契约（已完成）
 
 - 创建 `noctalia-mod/bin/`、`lib/`、`modules/`、`profiles/`、`tests/`。
 - 实现 CLI 参数解析、路径计算、root 检查、锁和统一错误码。
 - 定义模块加载和元数据校验。
 - 先建立隔离测试框架，再写部署逻辑。
 
-### 第 1 步：部署核心
+### 第 1 步：部署核心（已完成）
 
 - 实现 pre-flight 计划生成。
 - 实现目标路径安全检查。
@@ -317,37 +332,37 @@ $XDG_RUNTIME_DIR/noctalia-mod/
 - 实现 `__custom__` 与 preserve 保留。
 - 实现部署事务和失败恢复。
 
-### 第 2 步：状态与快照
+### 第 2 步：状态与快照（已完成）
 
 - 实现状态账本。
 - 实现自动快照、手动快照、回滚和快照清理。
 - 实现模块级 preset 状态。
 - 实现卸载和配置恢复。
 
-### 第 3 步：依赖流程
+### 第 3 步：依赖流程（已完成）
 
 - 实现依赖检查。
 - 实现统一依赖确认。
 - 实现 pacman 和已存在 AUR helper 的参数构造。
 - 记录由本项目安装的依赖，但默认不自动卸载。
 
-### 第 4 步：迁移 niri 和 noctalia
+### 第 4 步：迁移 niri 和 noctalia（已完成）
 
 - 先迁移 niri，覆盖 preserve、parts、权限和回滚。
 - 再迁移 Noctalia V5 配置。
-- 对照现有 Nyxuri 在隔离 HOME 中的部署结果。
+- 对照现有配置管理器在隔离 HOME 中的部署结果。
 
-### 第 5 步：迁移 Kitty、Fish、Starship
+### 第 5 步：迁移 Kitty、Fish、Starship（已完成）
 
 - 按相同协议接入三个基础模块。
 - 验证单模块安装、组合安装、独立卸载和部分失败恢复。
 
-### 第 6 步：对照验收和文档同步
+### 第 6 步：对照验收和文档同步（本次完成）
 
-- 汇总新旧行为差异。
+- 汇总并记录新旧行为差异。
 - 确认没有依赖、路径、状态和卸载残留。
-- 更新对应 `llms-wiki/` 页面和 `llms-wiki/llms.txt` 索引。
-- 不在没有验收前修改旧入口。
+- 更新 `noctalia-mod/` 内对应文档。
+- 已完成旧项目专属元素清理，并确认不修改旧入口。
 
 ## 13. 测试与验收标准
 
@@ -376,7 +391,6 @@ $XDG_RUNTIME_DIR/noctalia-mod/
 每一步实现后至少运行：
 
 ```bash
-python3 -m compileall -q nyxuri
 python3 -m unittest discover -s tests -q
 bash -n install.sh noctalia-mod/bin/noctalia-mod noctalia-mod/lib/*.sh noctalia-mod/modules/*/*.sh
 shellcheck install.sh noctalia-mod/bin/noctalia-mod noctalia-mod/lib/*.sh noctalia-mod/modules/*/*.sh
@@ -397,16 +411,16 @@ HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod uninstall niri noctalia
 
 后续开始实现时必须：
 
-1. 先读取本文件和相关 `llms-wiki/` 页面。
+1. 先读取本文件和 `noctalia-mod/` 内相关模块文档。
 2. 修改前检查 `git status`。
 3. 对路径、状态、部署、manifest 和模块行为有疑问时，全仓库检索引用。
-4. 不把旧 Nyxuri 的实现直接复制为新项目中央核心。
+4. 不把现有配置管理器的实现直接复制为新项目中央核心。
 5. 每一步保持新旧项目可并行运行。
 6. 每个模块独立测试，不依赖其他模块的隐式副作用。
 7. 不使用软链接写入 `~/.config`。
 8. 不在安装循环中增加无必要的阻断式确认。
 9. 破坏性操作前统一生成清单并确认。
-10. 涉及架构、部署、状态、模块、manifest 或 CLI 的代码变更，必须同步核验并更新 `llms-wiki/`。
+10. 涉及架构、部署、状态、模块、manifest 或 CLI 的代码变更，必须同步核验并更新 `noctalia-mod/` 内对应文档。
 11. 不主动提交 Git commit。
 12. 不新增调试输出、注释掉的代码或未完成的 TODO。
 
@@ -415,7 +429,7 @@ HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod uninstall niri noctalia
 - 新项目目录为 `noctalia-mod/`。
 - 新项目入口为 `noctalia-mod/bin/noctalia-mod`。
 - 第一阶段锁定 CachyOS，但保留未来扩展接口。
-- 不兼容旧 Nyxuri 状态，只安全识别和提示目标文件冲突。
+- 不兼容现有配置管理器状态，只安全识别和提示目标文件冲突。
 - 保留默认配置、官方 preset、`__custom__` 三层模型。
 - 依赖由中央流程统一检查，并在确认后安装。
 - 卸载默认不删除系统软件包。

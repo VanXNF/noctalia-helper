@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+export NOCTALIA_MOD_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+
+# shellcheck source=../lib/common.sh
+source "$NOCTALIA_MOD_ROOT/lib/common.sh"
+source "$NOCTALIA_MOD_ROOT/lib/paths.sh"
+source "$NOCTALIA_MOD_ROOT/lib/lock.sh"
+source "$NOCTALIA_MOD_ROOT/lib/state.sh"
+source "$NOCTALIA_MOD_ROOT/lib/module-loader.sh"
+source "$NOCTALIA_MOD_ROOT/lib/package-manager.sh"
+source "$NOCTALIA_MOD_ROOT/lib/deploy.sh"
+source "$NOCTALIA_MOD_ROOT/lib/snapshot.sh"
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  noctalia-mod list
+  noctalia-mod plan [module ...]
+  noctalia-mod install [module ...] [--yes]
+  noctalia-mod preset <module> list|apply <name> [--yes]
+  noctalia-mod part <module> <slot> list|apply <name> [--yes]
+  noctalia-mod snapshot [note]
+  noctalia-mod snapshot list|delete <id>
+  noctalia-mod rollback [snapshot-id]
+  noctalia-mod uninstall [module ...] [--yes]
+  noctalia-mod status
+USAGE
+}
+
+resolve_modules() {
+    local -a requested=("$@")
+    if ((${#requested[@]} == 0)); then
+        mapfile -t requested < <(module_ids)
+    fi
+    ((${#requested[@]})) || { error 'no modules are available'; return 1; }
+    local id
+    for id in "${requested[@]}"; do
+        module_load "$id" || return 1
+    done
+    RESOLVED_MODULES=("${requested[@]}")
+}
+
+environment_summary() {
+    if [[ -f /etc/cachyos-release ]]; then
+        printf 'environment\tCachyOS detected\n'
+    else
+        printf 'environment\tCachyOS marker not found (first-stage target only)\n'
+    fi
+    command -v niri >/dev/null 2>&1 || printf 'environment\tniri is not currently on PATH\n'
+    command -v noctalia >/dev/null 2>&1 || printf 'environment\tNoctalia is not currently on PATH\n'
+}
+
+collect_packages() {
+    local id package
+    PLAN_REPO_PACKAGES=()
+    PLAN_AUR_PACKAGES=()
+    for id in "$@"; do
+        module_load "$id"
+        for package in "${MODULE_REPO_PACKAGES[@]}"; do
+            contains_word "$package" "${PLAN_REPO_PACKAGES[@]}" || PLAN_REPO_PACKAGES+=("$package")
+        done
+        for package in "${MODULE_AUR_PACKAGES[@]}"; do
+            contains_word "$package" "${PLAN_AUR_PACKAGES[@]}" || PLAN_AUR_PACKAGES+=("$package")
+        done
+    done
+}
+
+print_plan() {
+    local -a modules=("$@") missing_repo=() missing_aur=()
+    local id target owner preserve
+    collect_packages "${modules[@]}"
+    mapfile -t missing_repo < <(package_missing "${PLAN_REPO_PACKAGES[@]}")
+    mapfile -t missing_aur < <(package_missing "${PLAN_AUR_PACKAGES[@]}")
+    printf 'Noctalia Mod pre-flight\n'
+    environment_summary
+    for id in "${modules[@]}"; do
+        module_load "$id"
+        target=$(safe_target_path "$MODULE_TARGET")
+        owner=external
+        [[ $(module_state_get "$id" enabled 2>/dev/null || true) == 1 ]] && owner=managed
+        printf 'module\t%s\t%s\t%s\n' "$id" "$target" "$owner"
+        for preserve in "${MODULE_PRESERVE[@]}"; do
+            [[ -e $target/$preserve || -L $target/$preserve ]] && printf 'preserve\t%s\t%s\n' "$id" "$preserve"
+        done
+        [[ -e $target || -L $target ]] && printf 'overwrite\t%s\t%s\n' "$id" "$target"
+        ((${#MODULE_RELOAD_COMMAND[@]})) && printf 'reload\t%s\t%s\n' "$id" "$(join_by ' ' "${MODULE_RELOAD_COMMAND[@]}")"
+    done
+    ((${#missing_repo[@]})) && printf 'missing-repo\t%s\n' "$(join_by ' ' "${missing_repo[@]}")"
+    ((${#missing_aur[@]})) && printf 'missing-aur\t%s\n' "$(join_by ' ' "${missing_aur[@]}")"
+    return 0
+}
+
+confirm_plan() {
+    local yes=$1
+    [[ $yes == yes ]] && return 0
+    [[ -t 0 ]] || {
+        error 'refusing a non-interactive install without --yes'
+        return 1
+    }
+    local answer
+    read -r -p 'Apply this plan? [y/N] ' answer
+    [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]]
+}
+
+install_dependencies() {
+    local -a missing_repo=() missing_aur=()
+    mapfile -t missing_repo < <(package_missing "${PLAN_REPO_PACKAGES[@]}")
+    mapfile -t missing_aur < <(package_missing "${PLAN_AUR_PACKAGES[@]}")
+    ((${#missing_repo[@]})) && package_install repo yes "${missing_repo[@]}"
+    ((${#missing_aur[@]})) && package_install aur yes "${missing_aur[@]}"
+    return 0
+}
+
+record_modules() {
+    local snapshot=$1
+    shift
+    local id target custom_paths preserve_paths part selected
+    local -a part_pairs=()
+    for id in "$@"; do
+        module_load "$id"
+        target=$(safe_target_path "$MODULE_TARGET")
+        custom_paths=$(find "$target" -name '*__custom__*' -printf '%P,' 2>/dev/null | sed 's/,$//' || true)
+        preserve_paths=$(join_by ',' "${MODULE_PRESERVE[@]}")
+        part_pairs=()
+        for part in "${MODULE_PARTS[@]}"; do
+            selected=$(module_state_get "$id" "part.$part" 2>/dev/null || true)
+            [[ -n $selected ]] || selected=$(module_part_default "$part")
+            part_pairs+=("part.$part" "$selected")
+        done
+        module_state_write "$id" \
+            enabled 1 \
+            preset "$(module_state_get "$id" preset 2>/dev/null || printf '%s' "$MODULE_PRESET_DEFAULT")" \
+            target "$MODULE_TARGET" \
+            source_version "$(state_project_version)" \
+            last_snapshot "$snapshot" \
+            custom_paths "$custom_paths" \
+            preserve_paths "$preserve_paths" \
+            last_result success \
+            "${part_pairs[@]}"
+    done
+}
+
+cmd_list() {
+    local id
+    printf 'module\ttarget\n'
+    while IFS= read -r id; do
+        module_load "$id"
+        printf '%s\t%s\n' "$id" "$MODULE_TARGET"
+    done < <(module_ids)
+}
+
+cmd_plan() {
+    local -a modules=()
+    resolve_modules "$@" || return 1
+    modules=("${RESOLVED_MODULES[@]}")
+    print_plan "${modules[@]}"
+}
+
+cmd_install() {
+    local yes=no arg part_slot=''
+    local -a requested=() modules=()
+    while (($#)); do
+        arg=$1
+        shift
+        case $arg in
+            --yes|--express) yes=yes ;;
+            --part-slot)
+                [[ $# -ge 1 ]] || { error '--part-slot requires a slot'; return 2; }
+                part_slot=$1
+                shift
+                ;;
+            --) ;;
+            -*) error "unknown install option: $arg"; return 2 ;;
+            *) requested+=("$arg") ;;
+        esac
+    done
+    resolve_modules "${requested[@]}" || return 1
+    modules=("${RESOLVED_MODULES[@]}")
+    print_plan "${modules[@]}"
+    confirm_plan "$yes" || return 1
+    install_dependencies || return 1
+    local snapshot id
+    snapshot=$(snapshot_create auto "before install: $(join_by ',' "${modules[@]}")" "${modules[@]}") || return 1
+    for id in "${modules[@]}"; do
+        if ! module_deploy "$id" "$part_slot"; then
+            error "deployment failed for $id; restoring $snapshot"
+            snapshot_restore "$snapshot" no "${modules[@]}" || error 'automatic restore failed; inspect the snapshot before retrying'
+            return 1
+        fi
+    done
+    record_modules "$snapshot" "${modules[@]}"
+    state_append_audit install "$(join_by ',' "${modules[@]}")"
+    log "installed: $(join_by ', ' "${modules[@]}")"
+}
+
+cmd_preset() {
+    local id=${1-} action=${2-} name=${3-} yes=no option install_rc=0
+    [[ -n $id && -n $action ]] || { usage; return 2; }
+    case $action in
+        list)
+            [[ $# -eq 2 ]] || { error 'preset list does not accept extra arguments'; return 2; }
+            module_load "$id"
+            printf 'default\n'
+            if [[ -d $(module_root "$id")/presets ]]; then
+                find "$(module_root "$id")/presets" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+            fi
+            ;;
+        apply)
+            [[ -n $name ]] || { error 'preset apply requires a preset name'; return 2; }
+            shift 3
+            for option in "$@"; do
+                [[ $option == --yes || $option == --express ]] && yes=yes || { error "unknown preset option: $option"; return 2; }
+            done
+            module_load "$id"
+            module_source_for_preset "$(module_root "$id")" "$name" >/dev/null || { error "unknown preset: $name"; return 1; }
+            local old_preset preset_was_set=no
+            old_preset=$(module_state_get "$id" preset 2>/dev/null || true)
+            [[ -n $old_preset ]] && preset_was_set=yes
+            state_module_set "$id" preset "$name"
+            if [[ $yes == yes ]]; then
+                cmd_install "$id" --yes || install_rc=$?
+            else
+                cmd_install "$id" || install_rc=$?
+            fi
+            if [[ ${install_rc:-0} -ne 0 ]]; then
+                if [[ $preset_was_set == yes ]]; then
+                    state_module_set "$id" preset "$old_preset"
+                else
+                    state_module_unset "$id" preset
+                fi
+                return 1
+            fi
+            ;;
+        *) error "unknown preset action: $action"; return 2 ;;
+    esac
+}
+
+cmd_part() {
+    local id=${1-} slot=${2-} action=${3-} name=${4-} yes=no option install_rc=0
+    [[ -n $id && -n $slot && -n $action ]] || { usage; return 2; }
+    module_load "$id"
+    contains_word "$slot" "${MODULE_PARTS[@]}" || { error "unknown part slot: $slot"; return 1; }
+    case $action in
+        list)
+            [[ $# -eq 3 ]] || { error 'part list does not accept extra arguments'; return 2; }
+            find "$(module_root "$id")/parts/$slot" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort
+            ;;
+        apply)
+            [[ -n $name ]] || { error 'part apply requires a part name'; return 2; }
+            shift 4
+            for option in "$@"; do
+                [[ $option == --yes || $option == --express ]] && yes=yes || { error "unknown part option: $option"; return 2; }
+            done
+            module_source_for_part "$(module_root "$id")" "$slot" "$name" >/dev/null || { error "unknown $slot part: $name"; return 1; }
+            local old_part part_was_set=no
+            old_part=$(module_state_get "$id" "part.$slot" 2>/dev/null || true)
+            [[ -n $old_part ]] && part_was_set=yes
+            state_module_set "$id" "part.$slot" "$name"
+            if [[ $yes == yes ]]; then
+                cmd_install "$id" --part-slot "$slot" --yes || install_rc=$?
+            else
+                cmd_install "$id" --part-slot "$slot" || install_rc=$?
+            fi
+            if [[ ${install_rc:-0} -ne 0 ]]; then
+                if [[ $part_was_set == yes ]]; then
+                    state_module_set "$id" "part.$slot" "$old_part"
+                else
+                    state_module_unset "$id" "part.$slot"
+                fi
+                return 1
+            fi
+            ;;
+        *) error "unknown part action: $action"; return 2 ;;
+    esac
+}
+
+cmd_snapshot() {
+    case ${1-} in
+        list)
+            [[ $# -eq 1 ]] || { error 'snapshot list does not accept extra arguments'; return 2; }
+            snapshot_list
+            ;;
+        delete)
+            [[ $# -eq 2 && -n ${2-} ]] || { error 'snapshot delete requires exactly one id'; return 2; }
+            snapshot_delete "$2"
+            ;;
+        *)
+            [[ $# -le 1 ]] || { error 'snapshot accepts at most one note'; return 2; }
+            local -a modules=()
+            mapfile -t modules < <(state_enabled_modules)
+            if ((${#modules[@]} == 0)); then
+                mapfile -t modules < <(module_ids)
+            fi
+            local id
+            id=$(snapshot_create manual "${1-}" "${modules[@]}") || return 1
+            log "snapshot created: $id"
+            ;;
+    esac
+}
+
+cmd_rollback() {
+    [[ $# -le 1 ]] || { error 'rollback accepts at most one snapshot id'; return 2; }
+    local id=${1-} protect
+    [[ -n $id ]] || id=$(snapshot_latest)
+    [[ -n $id ]] || { error 'no snapshots are available'; return 1; }
+    snapshot_exists "$id" || { error "snapshot not found: $id"; return 1; }
+    local -a modules=()
+    mapfile -t modules < <(state_enabled_modules)
+    protect=$(snapshot_create pre-rollback "before rollback to $id" "${modules[@]}") || return 1
+    snapshot_restore "$id" no
+    state_append_audit rollback "$id"
+    log "restored: $id (current state saved as $protect)"
+}
+
+cmd_uninstall() {
+    local yes=no arg id snapshot
+    local -a requested=() modules=()
+    for arg in "$@"; do
+        case $arg in
+            --yes|--express) yes=yes ;;
+            -*) error "unknown uninstall option: $arg"; return 2 ;;
+            *) requested+=("$arg") ;;
+        esac
+    done
+    if ((${#requested[@]})); then
+        resolve_modules "${requested[@]}" || return 1
+        modules=("${RESOLVED_MODULES[@]}")
+    else
+        mapfile -t modules < <(state_enabled_modules)
+    fi
+    ((${#modules[@]})) || { error 'no managed modules are installed'; return 1; }
+    printf 'Noctalia Mod uninstall\n'
+    for id in "${modules[@]}"; do
+        module_load "$id"
+        printf 'remove\t%s\t%s\n' "$id" "$(safe_target_path "$MODULE_TARGET")"
+    done
+    confirm_plan "$yes" || return 1
+    for id in "${modules[@]}"; do
+        snapshot=$(snapshot_for_module "$id")
+        if [[ -n $snapshot ]] && snapshot_exists "$snapshot"; then
+            snapshot_restore "$snapshot" no "$id"
+        else
+            module_clear_managed_config "$id"
+        fi
+        module_state_remove "$id"
+    done
+    state_append_audit uninstall "$(join_by ',' "${modules[@]}")"
+    log "uninstalled: $(join_by ', ' "${modules[@]}")"
+}
+
+cmd_status() {
+    local id
+    printf 'module\tstatus\tpreset\ttarget\n'
+    while IFS= read -r id; do
+        module_load "$id"
+        printf '%s\t%s\t%s\t%s\n' "$id" \
+            "$(module_state_get "$id" enabled 2>/dev/null || printf absent)" \
+            "$(module_state_get "$id" preset 2>/dev/null || printf '%s' "$MODULE_PRESET_DEFAULT")" \
+            "$(safe_target_path "$MODULE_TARGET")"
+    done < <(module_ids)
+}
+
+main() {
+    require_non_root || return 1
+    ensure_project_dirs
+    local command=${1-help}
+    shift || true
+    case $command in
+        list) cmd_list "$@" ;;
+        plan) cmd_plan "$@" ;;
+        install) with_project_lock cmd_install "$@" ;;
+        preset) with_project_lock cmd_preset "$@" ;;
+        part) with_project_lock cmd_part "$@" ;;
+        snapshot) with_project_lock cmd_snapshot "$@" ;;
+        rollback) with_project_lock cmd_rollback "$@" ;;
+        uninstall) with_project_lock cmd_uninstall "$@" ;;
+        status) cmd_status "$@" ;;
+        help|-h|--help) usage ;;
+        *) error "unknown command: $command"; usage; return 2 ;;
+    esac
+}
+
+main "$@"
