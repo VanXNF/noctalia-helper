@@ -101,8 +101,6 @@ def get_wallpaper_search_roots() -> list:
 
     # Priority 5: Built-in local fallbacks
     candidates.append(os.path.expanduser("~/.config/Wallpapers"))
-    repo_fallback = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "Wallpapers")
-    candidates.append(os.path.abspath(repo_fallback))
 
     resolved_roots = []
     seen_real_paths = set()

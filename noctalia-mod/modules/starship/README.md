@@ -16,3 +16,8 @@ Two consequences are deliberate:
   `starship.toml`.
 - `MODULE_VALIDATE_PATHS` is empty, because validation paths are resolved
   relative to the target and a file target has no children to check.
+
+Noctalia's starship template injects a `# >>> NOCTALIA STARSHIP PALETTE >>>` block into
+this same file, so `MODULE_RUNTIME_WRITES=(starship.toml)` declares it as runtime-written:
+the module still owns and overwrites the file, the fingerprint just ignores it. A file
+target has no child paths, which is why the declaration names the file itself (PLAN §1).

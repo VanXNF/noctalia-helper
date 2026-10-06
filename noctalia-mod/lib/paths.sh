@@ -33,6 +33,16 @@ preset_user_dir() {
     printf '%s/%s/%s\n' "$(preset_root)" "$module" "$name"
 }
 
+# XDG 图片目录。`xdg-user-dir` 不存在、超时或答不出绝对路径时回退 `$HOME/Pictures`。
+# LC_ALL=C 是有意的：输出必须与 locale 无关，否则中文 locale 下拿到的是"图片"那一份，
+# 而这个值要写进部署后的配置文件（PLAN §4 的 @XDG_PICTURES@ 占位符）。
+pictures_dir() {
+    local dir=''
+    dir=$(LC_ALL=C timeout 5 xdg-user-dir PICTURES 2>/dev/null) || dir=''
+    [[ -n $dir && $dir == /* ]] || dir="$(home_dir)/Pictures"
+    printf '%s\n' "$dir"
+}
+
 module_root() {
     printf '%s/modules/%s\n' "$(project_root)" "$1"
 }

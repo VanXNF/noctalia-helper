@@ -79,12 +79,22 @@ atomic_replace_item() {
     atomic_swap_staged "$staged" "$destination"
 }
 
-replace_home_placeholders() {
-    local root=$1 file escaped_home
+# 部署期占位符替换（PLAN §4）。两个占位符，都只出现在仓库源里：
+#   /home/user      → 真实 $HOME
+#   @XDG_PICTURES@  → 真实 XDG 图片目录（跟随 user-dirs.dirs 与 locale）
+# 只在暂存树上跑，所以单文件型目标不参与——它的源就是文件本身，没有暂存树。
+# 替换值里的 & 与 | 必须转义，否则会被 sed 当成反向引用与分隔符。
+replace_deploy_placeholders() {
+    local root=$1 file escaped_home escaped_pictures
     escaped_home=$(printf '%s' "$HOME" | sed 's/[&|]/\\&/g')
+    escaped_pictures=$(printf '%s' "$(pictures_dir)" | sed 's/[&|]/\\&/g')
     while IFS= read -r -d '' file; do
-        grep -qF '/home/user' "$file" || continue
-        sed -i "s|/home/user|$escaped_home|g" "$file"
+        if grep -qF '/home/user' "$file"; then
+            sed -i "s|/home/user|$escaped_home|g" "$file"
+        fi
+        if grep -qF '@XDG_PICTURES@' "$file"; then
+            sed -i "s|@XDG_PICTURES@|$escaped_pictures|g" "$file"
+        fi
     done < <(find "$root" -type f -print0)
 }
 
@@ -132,7 +142,7 @@ build_module_stage() {
         cp -a -- "$source"/. "$staged"/ || { rm -rf -- "$staged"; return 1; }
     fi
     apply_parts_to_stage "$root" "$staged" "$id" || { rm -rf -- "$staged"; return 1; }
-    replace_home_placeholders "$staged"
+    replace_deploy_placeholders "$staged"
     printf '%s\n' "$staged"
 }
 
@@ -146,10 +156,23 @@ module_validate_deployment() {
     done
 }
 
-# 部署指纹（PLAN §1）：只覆盖"本项目会覆盖的文件"，即排除 __custom__ 与
-# MODULE_PRESERVE。用户改 __custom__ 是设计内行为，不算漂移；运行时被改写的
-# 文件必须声明为 preserve，否则报漂移就是对的——它说明模块元数据漏了一个
-# 运行时写入者。权限位不进指纹：apply_chmod_rules 每次部署都会重新施加。
+# 声明了"运行时写入"的路径不进指纹（PLAN §1 / §10 P1-9）。
+#
+# 为什么不复用 MODULE_PRESERVE：preserve 的语义是"不要覆盖"——部署时会把实机版本原样
+# 拷回暂存树，于是模块再也更新不了自己的文件。而 kitty.conf 这种"我们拥有、运行时也会
+# 改"的文件两个语义都要：照旧覆盖更新，只是别把运行时的改动报成漂移。所以拆成两条声明。
+module_path_is_runtime_written() {
+    local relative=$1 entry
+    for entry in "${MODULE_RUNTIME_WRITES[@]}"; do
+        [[ $relative == "$entry" ]] && return 0
+    done
+    return 1
+}
+
+# 部署指纹（PLAN §1）：只覆盖"本项目会覆盖的文件"，即排除 __custom__、
+# MODULE_PRESERVE 与 MODULE_RUNTIME_WRITES。用户改 __custom__ 是设计内行为，不算漂移；
+# 运行时被改写的文件必须声明，否则报漂移就是对的——它说明模块元数据漏了一个写入者。
+# 权限位不进指纹：apply_chmod_rules 每次部署都会重新施加。
 module_fingerprint_stream() {
     local target=$1 path relative preserve skip
     [[ -e $target || -L $target ]] || return 0
@@ -158,6 +181,8 @@ module_fingerprint_stream() {
         return 0
     fi
     if [[ -f $target ]]; then
+        # 单文件型目标没有子路径可写，所以模块用文件名本身声明"这个目标会被运行时改写"。
+        module_path_is_runtime_written "${MODULE_TARGET##*/}" && return 0
         printf 'file\0'
         sha256sum < "$target" | cut -d' ' -f1
         printf '\0'
@@ -168,6 +193,7 @@ module_fingerprint_stream() {
         case $relative in
             *__custom__*) continue ;;
         esac
+        module_path_is_runtime_written "$relative" && continue
         skip=''
         for preserve in "${MODULE_PRESERVE[@]}"; do
             [[ $relative == "$preserve" ]] && {

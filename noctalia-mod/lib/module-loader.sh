@@ -8,6 +8,7 @@ MODULE_FILES='files'
 MODULE_REPO_PACKAGES=()
 MODULE_AUR_PACKAGES=()
 MODULE_PRESERVE=()
+MODULE_RUNTIME_WRITES=()
 MODULE_CHMOD=()
 MODULE_RELOAD_COMMAND=()
 MODULE_VALIDATE_PATHS=()
@@ -28,6 +29,7 @@ module_reset() {
     MODULE_REPO_PACKAGES=()
     MODULE_AUR_PACKAGES=()
     MODULE_PRESERVE=()
+    MODULE_RUNTIME_WRITES=()
     MODULE_CHMOD=()
     MODULE_RELOAD_COMMAND=()
     MODULE_VALIDATE_PATHS=()
@@ -94,7 +96,7 @@ module_load() {
             return 1
         }
     done
-    for path in "${MODULE_PRESERVE[@]}" "${MODULE_VALIDATE_PATHS[@]}" "${MODULE_EXTERNAL_REFS[@]}"; do
+    for path in "${MODULE_PRESERVE[@]}" "${MODULE_RUNTIME_WRITES[@]}" "${MODULE_VALIDATE_PATHS[@]}" "${MODULE_EXTERNAL_REFS[@]}"; do
         is_safe_relative_path "$path" || {
             error "invalid relative path in module $requested: $path"
             return 1

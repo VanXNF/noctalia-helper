@@ -42,6 +42,24 @@ noctalia-mod setup --with ffmpeg --with mpvpaper
 | `ffmpeg` | the video thumbnail `wallpaper-hook.sh` and the picker show |
 | `mpvpaper` | the plugin `noctalia-config.toml` enables to play those wallpapers |
 
+## Wallpaper paths and GTK theming
+
+`[wallpaper] directory` / `video_directory` are written with the `@XDG_PICTURES@`
+placeholder, which the deploy engine resolves to the real XDG Pictures directory (PLAN §4).
+The old engine rewrote those two lines after deploying; a placeholder keeps the engine from
+having to know which key of which module needs fixing, and keeps a Chinese-locale path out
+of the repository.
+
+Two things this module deliberately does **not** do:
+
+- **Render** the files under `templates/`. Noctalia's own TemplateEngine reads them through
+  the `[theme.templates.user.*]` registrations in `noctalia-config.toml` and writes
+  `gtk-{3,4}.0/gtk.css`, `niri/colors.kdl` and the palette. This project only ships the
+  sources.
+- **Sync GTK dark/light state.** `theme sync` (engine-level, PLAN §10 P1-8) writes
+  `gtk-{3,4}.0/settings.ini` and `gsettings … gtk-theme`; Noctalia only sets
+  `color-scheme`.
+
 ## Referenced but not provided
 
 Listed in `MODULE_EXTERNAL_REFS` so `check` stays honest:
@@ -57,5 +75,10 @@ Listed in `MODULE_EXTERNAL_REFS` so `check` stays honest:
 
 `wallpaper-hook.sh` keeps its thumbnail in `$XDG_RUNTIME_DIR`; the tools read the
 Material You palette from `~/.cache/noctalia-mod/palette.toml`, which is where
-`noctalia-config.toml` tells Noctalia to render it. Nothing under this module is
-declared preserve, because no runtime process writes back into the deployed tree.
+`noctalia-config.toml` tells Noctalia to render it.
+
+This module declares neither `MODULE_PRESERVE` nor `MODULE_RUNTIME_WRITES`: everything
+Noctalia writes back at runtime (`gtk-{3,4}.0/gtk.css`, `niri/colors.kdl`, the palette)
+lands outside `~/.config/noctalia/`, so nothing inside its own target is rewritten. The
+wallpaper directory is outside `~/.config` entirely and is handled by the engine
+(`wallpapers deploy`, PLAN §4).

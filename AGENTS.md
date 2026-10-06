@@ -89,6 +89,7 @@ HOME=$(mktemp -d) ./install.sh test
 | 文件/目录名含 `__custom__` | 更新时自动保留，不需手动处理 |
 | 脚本以 `id -u == 0` 运行 | `install.sh`/`nyxuri` 直接拒绝；系统级维护脚本（如 `clean-cache`）例外，允许要求 root |
 | `configs/` 模板里的 `/home/user` | 占位符，由部署引擎替换为目标 `$HOME`，勿改为硬编码 |
+| `noctalia-mod/` 模板里的 `@XDG_PICTURES@` | 占位符，由部署引擎替换为 XDG 图片目录（`xdg-user-dir PICTURES`），勿改为硬编码的 `~/图片` 之类 |
 | GPU 环境变量 | 默认配置不指定驱动，部署不按 PCI 设备自动改写；诊断仅分类设备，不推断实际渲染 GPU |
 | 网络命令（curl 等） | 必须带 `--connect-timeout`，非关键调用加容错 |
 | 引擎代码（`nyxuri/`） | 避免硬编码特定项目名，用 `constants.py` 常量；TUI 文案可适当灵活 |

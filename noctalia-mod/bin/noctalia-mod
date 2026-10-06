@@ -23,6 +23,10 @@ source "$NOCTALIA_MOD_ROOT/lib/package-manager.sh"
 source "$NOCTALIA_MOD_ROOT/lib/deploy.sh"
 # shellcheck source=../lib/preset.sh
 source "$NOCTALIA_MOD_ROOT/lib/preset.sh"
+# shellcheck source=../lib/theme.sh
+source "$NOCTALIA_MOD_ROOT/lib/theme.sh"
+# shellcheck source=../lib/wallpaper.sh
+source "$NOCTALIA_MOD_ROOT/lib/wallpaper.sh"
 # shellcheck source=../lib/snapshot.sh
 source "$NOCTALIA_MOD_ROOT/lib/snapshot.sh"
 # shellcheck source=../lib/reference-check.sh
@@ -40,6 +44,8 @@ Usage:
   noctalia-mod preset <module> list
   noctalia-mod preset <module> apply|save|edit|delete <name> [--yes]
   noctalia-mod part <module> <slot> list|apply <name> [--yes]
+  noctalia-mod theme sync|status
+  noctalia-mod wallpapers [deploy|status|remove]
   noctalia-mod snapshot [note]
   noctalia-mod snapshot list|delete <id>
   noctalia-mod rollback [snapshot-id]
@@ -451,6 +457,7 @@ cmd_install() {
     done
     ((${#MODULE_DEPLOY_FROZEN[@]})) && warn "left as is (preset missing): $(join_by ', ' "${MODULE_DEPLOY_FROZEN[@]}")"
     ((${#deployed[@]})) && log "installed: $(join_by ', ' "${deployed[@]}")"
+    finish_deploy
     return 0
 }
 
@@ -541,7 +548,13 @@ cmd_setup() {
     done
     record_modules "$snapshot" "${modules[@]}"
     state_append_audit setup "$(join_by ',' "${modules[@]}")"
+    finish_deploy
+    # 壁纸是用户可见的数据、在 ~/.config 之外，所以只有引导路径（从零到桌面）碰它；
+    # `install` 的契约是"只动 ~/.config"。要单独重跑就用 `wallpapers deploy`。
+    local wallpaper_report=''
+    wallpaper_report=$(wallpaper_deploy) || warn 'wallpaper deploy failed; the wallpaper directory may be empty'
     print_setup_summary "${modules[@]}"
+    [[ -n $wallpaper_report ]] && printf '%s\n' "$wallpaper_report"
 }
 
 cmd_preset() {
@@ -746,6 +759,52 @@ cmd_uninstall() {
     log "uninstalled: $(join_by ', ' "${modules[@]}")"
 }
 
+# GTK 深浅同步（PLAN §10 P1-8）。部署收尾调一次，失败只警告：配置已经铺好了，
+# 不该因为 gsettings 或会话不可用就把一次成功的部署弄成失败。
+finish_deploy() {
+    theme_sync >/dev/null || warn 'theme sync failed; GTK apps may not follow the current mode'
+    return 0
+}
+
+cmd_theme() {
+    case ${1-} in
+        sync)
+            [[ $# -le 1 ]] || { error 'theme sync does not accept extra arguments'; return 2; }
+            theme_sync
+            ;;
+        status)
+            [[ $# -eq 1 ]] || { error 'theme status does not accept extra arguments'; return 2; }
+            theme_status
+            ;;
+        *) error 'theme takes sync or status'; return 2 ;;
+    esac
+}
+
+cmd_wallpapers() {
+    local action=${1-deploy}
+    case $action in
+        deploy)
+            [[ $# -le 1 ]] || { error 'wallpapers deploy does not accept extra arguments'; return 2; }
+            local report
+            report=$(wallpaper_deploy) || return 1
+            [[ -n $report ]] && printf '%s\n' "$report"
+            state_append_audit wallpapers-deploy "$(wallpaper_dir)"
+            ;;
+        status)
+            [[ $# -le 1 ]] || { error 'wallpapers status does not accept extra arguments'; return 2; }
+            wallpaper_status
+            ;;
+        remove)
+            [[ $# -le 1 ]] || { error 'wallpapers remove does not accept extra arguments'; return 2; }
+            local report
+            report=$(wallpaper_remove_managed) || return 1
+            [[ -n $report ]] && printf '%s\n' "$report"
+            state_append_audit wallpapers-remove "$(wallpaper_dir)"
+            ;;
+        *) error "unknown wallpapers action: $action"; return 2 ;;
+    esac
+}
+
 cmd_status() {
     local id
     printf 'module\tstatus\tpreset\ttarget\n'
@@ -772,6 +831,8 @@ main() {
         install) with_project_lock cmd_install "$@" ;;
         preset) with_project_lock cmd_preset "$@" ;;
         part) with_project_lock cmd_part "$@" ;;
+        theme) cmd_theme "$@" ;;
+        wallpapers) with_project_lock cmd_wallpapers "$@" ;;
         snapshot) with_project_lock cmd_snapshot "$@" ;;
         rollback) with_project_lock cmd_rollback "$@" ;;
         uninstall) with_project_lock cmd_uninstall "$@" ;;

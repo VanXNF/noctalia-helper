@@ -27,8 +27,25 @@ printf '%s' "$(basename \"$0\")" >> \"$FAKE_LOG\"
 printf ' <%s>' \"$@\" >> \"$FAKE_LOG\"
 printf '\\n' >> \"$FAKE_LOG\"
 """
-        for name in ("niri", "noctalia", "pkill"):
+        for name in ("niri", "pkill"):
             (fake_bin / name).write_text(common + "exit 0\n")
+        # noctalia 除了回 reload，还要能回答 theme-mode-get（部署收尾会问一次）。
+        (fake_bin / "noctalia").write_text(
+            common
+            + 'if [[ ${1-} == msg && ${2-} == theme-mode-get ]]; then\n'
+            + '    printf \'%s\\n\' "${FAKE_THEME_MODE:-dark}"\n'
+            + "fi\n"
+            + "exit 0\n"
+        )
+        # XDG 图片目录：测试通过 FAKE_PICTURES 指定，默认落在 $HOME/Pictures。
+        (fake_bin / "xdg-user-dir").write_text(
+            common + 'echo "${FAKE_PICTURES:-$HOME/Pictures}"\n'
+        )
+        (fake_bin / "gsettings").write_text(
+            common
+            + 'if [[ ${1-} == get ]]; then printf "\'%s\'\\n" "${FAKE_COLOR_SCHEME:-prefer-dark}"; fi\n'
+            + "exit 0\n"
+        )
         (fake_bin / "pacman").write_text(
             common
             + "[[ ${1-} == -Q ]] && exit 1\n"
@@ -1439,6 +1456,216 @@ printf '\\n' >> \"$FAKE_LOG\"
             for gone in ("layout.kdl", "config.kdl", "animations.kdl"):
                 self.assertFalse((niri / gone).exists(), f"{gone} should have been removed")
 
+    def test_xdg_pictures_placeholder_follows_the_users_pictures_dir(self) -> None:
+        """PLAN §4: the shipped config must not hardcode a locale-specific 图片 path."""
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            pictures = env.home / "Pics"
+            pictures.mkdir()
+            installed = self._run(
+                env, fake_bin, "install", "noctalia", "niri", "--yes",
+                extra_env={"FAKE_PICTURES": str(pictures)},
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            config = env.home / ".config"
+            office = (config / "noctalia" / "noctalia-config.toml").read_text()
+            self.assertIn(f'directory = "{pictures}/Wallpapers"', office)
+            self.assertIn(f'video_directory = "{pictures}/Wallpapers/video"', office)
+            niri = (config / "niri" / "config.kdl").read_text()
+            self.assertIn(f'screenshot-path "{pictures}/Screenshots/', niri)
+            for text in (office, niri):
+                self.assertNotIn("@XDG_PICTURES@", text, "an unsubstituted placeholder must never ship")
+            self.assertNotIn(f"{env.home}/图片", office, "no locale-specific hardcoded path may ship")
+
+    def test_xdg_pictures_falls_back_when_the_tool_cannot_answer(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            # 答不出来（缺失、超时、或给的不是绝对路径）时才回退 $HOME/Pictures。
+            # 注意不能靠"删掉替身"来测这个：PATH 后面还有真的 xdg-user-dir，
+            # 它在没有 user-dirs.dirs 时会按 XDG 规定答 $HOME。
+            (fake_bin / "xdg-user-dir").write_text("#!/usr/bin/env bash\nexit 1\n")
+            (fake_bin / "xdg-user-dir").chmod(0o755)
+            installed = self._run(env, fake_bin, "install", "noctalia", "--yes")
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            office = (env.home / ".config" / "noctalia" / "noctalia-config.toml").read_text()
+            self.assertIn(f'directory = "{env.home}/Pictures/Wallpapers"', office)
+
+    def test_theme_sync_follows_the_current_mode(self) -> None:
+        """P1-8: Noctalia sets color-scheme but never gtk-theme or settings.ini."""
+        with TempEnv() as env:
+            fake_bin, log = self._fake_commands(env)
+            dark = self._run(env, fake_bin, "theme", "sync", extra_env={"FAKE_THEME_MODE": "dark"})
+            self.assertEqual(dark.returncode, 0, dark.stderr)
+            settings = env.home / ".config" / "gtk-3.0" / "settings.ini"
+            self.assertIn("gtk-theme-name = adw-gtk3-dark", settings.read_text())
+            self.assertIn("gtk-application-prefer-dark-theme = true", settings.read_text())
+            self.assertIn(
+                "gsettings <set> <org.gnome.desktop.interface> <color-scheme> <prefer-dark>",
+                log.read_text(),
+            )
+            self.assertIn(
+                "gsettings <set> <org.gnome.desktop.interface> <gtk-theme> <adw-gtk3-dark>",
+                log.read_text(),
+            )
+
+            light = self._run(env, fake_bin, "theme", "sync", extra_env={"FAKE_THEME_MODE": "light"})
+            self.assertEqual(light.returncode, 0, light.stderr)
+            self.assertIn("gtk-theme-name = adw-gtk3", settings.read_text())
+            self.assertIn("gtk-application-prefer-dark-theme = false", settings.read_text())
+            for version in ("gtk-3.0", "gtk-4.0"):
+                self.assertTrue((env.home / ".config" / version / "settings.ini").is_file(), version)
+
+    def test_theme_sync_preserves_unrelated_settings_ini_content(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            settings = env.home / ".config" / "gtk-3.0" / "settings.ini"
+            settings.parent.mkdir(parents=True)
+            settings.write_text(
+                "[Settings]\ngtk-theme-name = old-theme\ngtk-font-name = Some Font 11\n",
+                encoding="utf-8",
+            )
+            result = self._run(env, fake_bin, "theme", "sync", extra_env={"FAKE_THEME_MODE": "dark"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            content = settings.read_text()
+            self.assertIn("gtk-font-name = Some Font 11", content)
+            self.assertIn("gtk-theme-name = adw-gtk3-dark", content)
+            self.assertNotIn("old-theme", content)
+
+    def test_theme_status_reports_what_is_expected(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            result = self._run(env, fake_bin, "theme", "status", extra_env={"FAKE_THEME_MODE": "light"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("mode\tlight", result.stdout)
+            self.assertIn("expected-gtk-theme\tadw-gtk3", result.stdout)
+
+    def test_deploy_syncs_the_theme_without_failing_the_install(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            (fake_bin / "gsettings").write_text("#!/usr/bin/env bash\nexit 1\n")
+            (fake_bin / "gsettings").chmod(0o755)
+            installed = self._run(env, fake_bin, "install", "noctalia", "--yes")
+            self.assertEqual(
+                installed.returncode, 0,
+                "a broken gsettings must not fail a successful config deploy",
+            )
+            self.assertTrue((env.home / ".config" / "gtk-3.0" / "settings.ini").is_file())
+
+    def test_wallpaper_deploy_records_only_what_it_placed(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            pictures = env.home / "Pics"
+            first = self._run(
+                env, fake_bin, "wallpapers", "deploy",
+                extra_env={"FAKE_PICTURES": str(pictures)},
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            wallpapers = pictures / "Wallpapers"
+            self.assertTrue((wallpapers / "lawson_fuji.webp").is_file())
+            ledger = wallpapers / ".noctalia-mod-managed"
+            self.assertEqual(ledger.read_text().split(), ["lawson_fuji.webp"])
+            self.assertIn("1 new", first.stdout)
+
+            # 用户自己的图不属于我们，也不该进账本。
+            (wallpapers / "mine.webp").write_text("user file\n", encoding="utf-8")
+            second = self._run(
+                env, fake_bin, "wallpapers", "deploy",
+                extra_env={"FAKE_PICTURES": str(pictures)},
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertIn("0 new, 1 already present", second.stdout)
+            self.assertEqual(ledger.read_text().split(), ["lawson_fuji.webp"])
+
+    def test_wallpapers_remove_keeps_user_files_and_refuses_unsafe_entries(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            pictures = env.home / "Pics"
+            self._run(env, fake_bin, "wallpapers", "deploy", extra_env={"FAKE_PICTURES": str(pictures)})
+            wallpapers = pictures / "Wallpapers"
+            (wallpapers / "mine.webp").write_text("user file\n", encoding="utf-8")
+
+            removed = self._run(
+                env, fake_bin, "wallpapers", "remove", extra_env={"FAKE_PICTURES": str(pictures)}
+            )
+            self.assertEqual(removed.returncode, 0, removed.stderr)
+            self.assertFalse((wallpapers / "lawson_fuji.webp").exists())
+            self.assertTrue((wallpapers / "mine.webp").is_file(), "only ledger entries may be removed")
+            self.assertFalse((wallpapers / ".noctalia-mod-managed").exists(), "an empty ledger is deleted")
+
+            # 手改过的账本里出现越界路径：拒绝，并且留在账本里等下次再报。
+            (wallpapers / ".noctalia-mod-managed").write_text("../../etc/passwd\n", encoding="utf-8")
+            unsafe = self._run(
+                env, fake_bin, "wallpapers", "remove", extra_env={"FAKE_PICTURES": str(pictures)}
+            )
+            self.assertEqual(unsafe.returncode, 0, unsafe.stderr)
+            self.assertIn("refusing an unsafe ledger entry", unsafe.stderr)
+            self.assertEqual(
+                (wallpapers / ".noctalia-mod-managed").read_text().strip(), "../../etc/passwd"
+            )
+            self.assertTrue(Path("/etc/passwd").is_file())
+
+    def test_setup_deploys_wallpapers_but_install_does_not(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            pictures = env.home / "Pics"
+            extra = {"FAKE_PICTURES": str(pictures)}
+
+            installed = self._run(env, fake_bin, "install", "kitty", "--yes", extra_env=extra)
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            self.assertFalse((pictures / "Wallpapers").exists(), "install only touches ~/.config")
+
+            configured = self._run(env, fake_bin, "setup", "--yes", extra_env=extra)
+            self.assertEqual(configured.returncode, 0, configured.stderr)
+            self.assertTrue((pictures / "Wallpapers" / "lawson_fuji.webp").is_file())
+            self.assertIn("wallpapers\t1 new", configured.stdout)
+
+    def test_runtime_written_files_do_not_report_drift(self) -> None:
+        """P1-9: Noctalia rewrites these in place, so they must not count as drift."""
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            installed = self._run(env, fake_bin, "install", "kitty", "starship", "--yes")
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            config = env.home / ".config"
+
+            clean = self._run(env, fake_bin, "plan", "kitty", "starship")
+            self.assertNotIn("drift", clean.stdout)
+
+            # 模拟 Noctalia 的内置模板：改写 kitty.conf / themes/noctalia.conf / starship.toml
+            with (config / "kitty" / "kitty.conf").open("a", encoding="utf-8") as handle:
+                handle.write("\ninclude themes/noctalia.conf\n")
+            with (config / "kitty" / "themes" / "noctalia.conf").open("a", encoding="utf-8") as handle:
+                handle.write("color0 #000000\n")
+            with (config / "starship.toml").open("a", encoding="utf-8") as handle:
+                handle.write("# >>> NOCTALIA STARSHIP PALETTE >>>\n")
+
+            rewritten = self._run(env, fake_bin, "plan", "kitty", "starship")
+            self.assertEqual(rewritten.returncode, 0, rewritten.stderr)
+            self.assertNotIn(
+                "drift", rewritten.stdout,
+                "files declared as runtime-written must not be reported as drift",
+            )
+            self.assertIn(
+                "include themes/noctalia.conf",
+                (config / "kitty" / "kitty.conf").read_text(),
+                "declaring a runtime writer must not make the file preserve-on-deploy",
+            )
+
+    def test_runtime_written_files_are_still_overwritten_by_a_deploy(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            self._run(env, fake_bin, "install", "starship", "--yes")
+            target = env.home / ".config" / "starship.toml"
+            shipped = target.read_text()
+            with target.open("a", encoding="utf-8") as handle:
+                handle.write("\n# runtime noise\n")
+
+            again = self._run(env, fake_bin, "install", "starship", "--yes")
+            self.assertEqual(again.returncode, 0, again.stderr)
+            self.assertEqual(
+                target.read_text(), shipped,
+                "runtime-written is about the fingerprint only — the module still owns the file",
+            )
+
     def test_module_metadata_is_validated(self) -> None:
         cases = {
             "id mismatch": (
@@ -1462,6 +1689,11 @@ printf '\\n' >> \"$FAKE_LOG\"
             "invalid part slot": (
                 "MODULE_ID='probe'\nMODULE_TARGET='probe'\nMODULE_PARTS=(Bad)\n",
                 "invalid part",
+            ),
+            "escaping runtime-write": (
+                "MODULE_ID='probe'\nMODULE_TARGET='probe'\n"
+                "MODULE_RUNTIME_WRITES=('../escape')\n",
+                "invalid relative path",
             ),
         }
         for label, (conf, expected) in cases.items():

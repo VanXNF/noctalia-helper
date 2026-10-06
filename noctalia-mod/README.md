@@ -55,6 +55,8 @@ noctalia-mod/bin/noctalia-mod plan niri noctalia
 noctalia-mod/bin/noctalia-mod preset kitty list
 noctalia-mod/bin/noctalia-mod preset kitty apply transparent --yes
 noctalia-mod/bin/noctalia-mod part niri glow apply glow --yes
+noctalia-mod/bin/noctalia-mod theme sync
+noctalia-mod/bin/noctalia-mod wallpapers deploy
 noctalia-mod/bin/noctalia-mod snapshot "before edit"
 noctalia-mod/bin/noctalia-mod rollback
 noctalia-mod/bin/noctalia-mod status
@@ -95,6 +97,37 @@ away your configuration and recomputing the fingerprint would hide the drift.
 `plan` and `setup` print `preset-missing <module> <preset> frozen` for it. Only
 when the target is gone too does a deploy fall back to `default`, since there is
 nothing left to lose.
+
+## What a deploy also does
+
+Two things Noctalia does not do for us, run at the end of `install` and `setup`:
+
+- **`theme sync`** writes `gtk-{3,4}.0/settings.ini` (`gtk-application-prefer-dark-theme`,
+  `gtk-theme-name`) and sets `gsettings … gtk-theme`, following the current mode. Noctalia
+  keeps `color-scheme` in step but never touches either of those — and Brave/Chromium read
+  `settings.ini` at cold start. It warns instead of failing the deploy if `gsettings` or a
+  session bus is unavailable.
+- **Wallpapers** (`wallpapers deploy|status|remove`): the offline pack travels with the
+  project in `assets/wallpapers/` and is copied into `<XDG Pictures>/Wallpapers`
+  no-clobber — an existing file wins. Everything this project places is recorded in
+  `<that dir>/.noctalia-mod-managed`, and `wallpapers remove` deletes only those entries,
+  so your own wallpapers stay. `setup` deploys them; `install` does not, because its
+  contract is "only `~/.config`".
+
+Paths in the shipped config use two placeholders, substituted while staging: `/home/user`
+becomes your `$HOME`, and `@XDG_PICTURES@` becomes the XDG Pictures directory (the
+wallpaper directory, the video directory, niri's `screenshot-path`). Neither placeholder
+may survive into a deployed file.
+
+## Drift and runtime writers
+
+A file the runtime rewrites but this project still owns — Noctalia rewrites `kitty.conf`,
+`kitty/themes/noctalia.conf` and `starship.toml` in place — is declared in
+`MODULE_RUNTIME_WRITES`: it is still overwritten on every deploy, but it does not count as
+drift. That is deliberately separate from `MODULE_PRESERVE`, which means "do not
+overwrite": using preserve here would stop the module from ever updating its own file.
+The cost is that those files give up drift detection, which is the point — reporting drift
+for a file the runtime always rewrites only teaches people to ignore drift.
 
 ## Reference check
 

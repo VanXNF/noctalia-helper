@@ -113,16 +113,26 @@ noctalia-mod install --yes             # 全量，非交互
    旧引擎转为只读回退路径，随后删除。切换前不新增对旧状态的依赖。
 
 指纹刻意选轻：整个模块一个摘要，不做逐文件版本库。覆盖范围只包括"本项目会覆盖
-的文件"，即排除 `__custom__` 与 `MODULE_PRESERVE`：
+的文件"，即排除 `__custom__`、`MODULE_PRESERVE` 与 `MODULE_RUNTIME_WRITES`：
 
 - 用户改 `__custom__` 是设计内行为，不该报漂移；
-- 运行时被改写的文件（如 Noctalia 渲染的 `niri/colors.kdl`、被 `toggle-eyecare.sh`
-  改指向的 `niri/effects.kdl`）必须声明为 preserve，声明了就不算漂移；
-- 反过来说，**如果某个运行时写入者没被声明，报漂移就是对的**——它说明模块元数据
-  漏了一个写入者，这比默默覆盖有价值。
+- 运行时被改写、且**我们不再拥有**的文件（如 Noctalia 渲染的 `niri/colors.kdl`、
+  被 `toggle-eyecare.sh` 改指向的 `niri/effects.kdl`）声明为 `MODULE_PRESERVE`：
+  部署时不覆盖，指纹也不看；
+- 运行时被改写、但**我们仍然拥有**的文件（Noctalia 会就地重写 `kitty.conf`、
+  `kitty/themes/noctalia.conf`、`starship.toml`）声明为 `MODULE_RUNTIME_WRITES`：
+  照旧被部署覆盖，只是不进指纹。**这两件事必须分开**——用 preserve 顶替会让模块
+  再也更新不了自己的文件（§10 P1-9）；
+- 反过来说，**如果某个运行时写入者两条声明都没有，报漂移就是对的**——它说明模块
+  元数据漏了一个写入者，这比默默覆盖有价值。
+
+单文件型目标没有子路径可写，所以用**目标文件名本身**放进 `MODULE_RUNTIME_WRITES`
+表示"这个文件会被运行时改写"（starship 就是这种）。
 
 已知取舍：摘要只能告诉你"这个模块变了"，说不出是哪个文件变的；要说清楚得把文件
 清单也存进账本。权限位不进指纹（`apply_chmod_rules` 每次部署都会重新施加）。
+被声明成运行时写入的文件放弃了漂移检测——这是有意的：对它们报漂移只会训练用户忽略
+漂移报告。
 
 ## 2. 目标目录结构
 
@@ -139,10 +149,14 @@ noctalia-mod/
 │   ├── snapshot.sh        # 快照、回滚、清理
 │   ├── deploy.sh          # 暂存构建、原子替换、保留规则
 │   ├── preset.sh          # 用户预设的存取与预设消失语义
+│   ├── theme.sh           # GTK 深浅同步（Noctalia 不做的那一半）
+│   ├── wallpaper.sh       # 壁纸部署与 managed 账本
 │   ├── reference-check.sh # 引用与程序声明的静态自洽校验
 │   └── module-loader.sh   # 模块元数据加载与校验
 ├── modules/
 │   └── <module>/          # 见 §3
+├── assets/
+│   └── wallpapers/        # 离线壁纸（随子项目走，便于整目录独立取走）
 ├── tests/                 # 子项目自带测试（自包含）
 ├── PLAN.md                # 本文档：方案与进度
 └── README.md              # 使用说明
@@ -178,7 +192,8 @@ modules/<module>/
 | `MODULE_FILES` | 默认配置源目录，默认 `files` |
 | `MODULE_REPO_PACKAGES` | 官方仓库依赖 |
 | `MODULE_AUR_PACKAGES` | AUR 依赖 |
-| `MODULE_PRESERVE` | 按名保留的路径（运行时会话状态） |
+| `MODULE_PRESERVE` | 按名保留的路径（部署时不覆盖，原样继承实机版本） |
+| `MODULE_RUNTIME_WRITES` | 运行时也会改写、但模块仍然拥有并覆盖的路径（只影响指纹，不影响覆盖），见 §1 |
 | `MODULE_CHMOD` | 需要加执行位的相对 glob |
 | `MODULE_RELOAD_COMMAND` | 部署后的 reload/reload 动作（argv 数组） |
 | `MODULE_VALIDATE_PATHS` | 部署后必须存在的路径 |
@@ -256,8 +271,11 @@ modules/<module>/
   import 之间没有自动校验。第一个实例是 noctalia 的 `import cairo`，需要
   `python-cairo`——迁移 tools 时才暴露出来（见 §10 已修复）。
 
-**暂不实现**：`hooks.sh` 生命周期钩子。协议里保留这个概念，但引擎不实现、
-模块不提供，直到真正需要（§11 阶段 D 重新评估）。
+**没有 `hooks.sh`**（阶段 D 复评后关闭）：模块侧的收尾动作由
+`MODULE_RELOAD_COMMAND` 承担，运行时写入的文件由 `MODULE_PRESERVE` 声明，引擎级的全局
+步骤（路径改写、GTK 深浅同步）属于引擎自己。旧引擎里唯一像"模块钩子"的东西是
+`.module.toml` 的 `post_install = "模块:函数"`（fcitx5-rime 在用），那是阶段 F 的事，
+届时单独设计，不复活这个已经空转了两轮的概念。
 
 ## 4. 配置层次与保留规则
 
@@ -318,6 +336,37 @@ $XDG_CONFIG_HOME/noctalia-mod/presets/<module>/<name>/
 隐藏临时目录（`.noctalia-mod.new.*` / `.noctalia-mod.old.*`），完成后就地清理。
 `$XDG_CACHE_HOME/noctalia-mod/` 不是本管理器的临时目录，它是 Noctalia 渲染
 Material You 色板的输出位置（见 noctalia 模块配置），子项目只是沿用这个位置。
+
+**部署期占位符**（只在暂存树上替换，所以单文件型目标不参与）：
+
+| 占位符 | 替换成 | 例子 |
+|---|---|---|
+| `/home/user` | 真实 `$HOME` | `input_path = "/home/user/.config/..."` |
+| `@XDG_PICTURES@` | XDG 图片目录（`xdg-user-dir PICTURES`，答不出来才回退 `$HOME/Pictures`） | `directory = "@XDG_PICTURES@/Wallpapers"` |
+
+`@XDG_PICTURES@` 是阶段 D 加的（§10 P1-7）：旧引擎在部署后原地改写 noctalia 的
+`directory` / `video_directory` 与 niri 的 `screenshot-path`，新项目原来只做 `/home/user`
+替换，于是把仓库源里写死的中文 locale 路径 `$HOME/图片/Wallpapers` 原样铺下去。
+占位符比"部署后按文件名正则改写"干净：引擎不需要知道哪个模块的哪个键要改。
+
+**注释里不要写占位符字面量**——替换会连注释一起改，留下一句读不通的话。
+
+**壁纸不在 `~/.config` 里**，所以它不归任何模块（模块目标必须是配置根内的相对路径），
+是引擎自己的步骤：
+
+- 目标目录：`<XDG 图片目录>/Wallpapers`
+- 账本：`<壁纸目录>/.noctalia-mod-managed`，一行一个顶层名字（本项目放进去的东西）
+- 同步：no-clobber（同名文件已存在就跳过，用户的版本优先），但仍记进账本
+- 清理：`wallpapers remove` 只删账本里的条目；账本里出现越界路径（`..`、带分隔符）
+  就拒绝执行并**留在账本里**，不静默遗忘
+- 只有 `setup`（从零到桌面）会顺手部署壁纸；`install` 的契约是"只动 `~/.config`"
+- 远程壁纸包下载不迁
+
+**GTK 深浅同步**（`theme sync`，§10 P1-8）也是引擎步骤：Noctalia 跟着模式设
+`color-scheme`，但既不设 `gtk-theme` 也不写 `gtk-{3,4}.0/settings.ini`，而 Brave
+一类应用的冷启动就读后者。`install` / `setup` 的收尾各跑一次，失败只警告——配置已经
+铺好了，不该因为 `gsettings` 或会话不可用就把一次成功的部署弄成失败。模式切换时的实时
+同步（旧引擎的 `theme_mode_changed` hook）留到阶段 G：那时二进制才真的在 PATH 上。
 
 部署时必须继续遵守：
 
@@ -500,6 +549,21 @@ aur-helper	paru
 - 用户预设：存在 `~/.config/noctalia-mod/presets/<模块>/<名字>/`，与官方预设同一套
   解析顺序（官方优先）；`save` 不带 `__custom__`、覆盖前确认、拒绝保留字与官方同名；
   `delete` / `edit` 只作用于用户预设。活跃预设消失时按 §4 的冻结/回退语义处理。
+- 阶段 D 的调研与止血：查清旧引擎的壁纸能力（部署 + managed 账本 + 部署期改写
+  路径），并清掉 `wallpaper_picker/config.py` 里那条仓库相对回退路径——它在任何布局下
+  都指不到东西（零行为变更，旧引擎那份源不动）。查出的路径回归记为 §10 P1-7。
+- `shell-action.sh` / `session-shell.sh` 定稿为只留 Noctalia（§11 阶段 D），与旧引擎
+  逐行对照确认只少了自研外壳路由。
+- 部署期占位符：`/home/user` 与 `@XDG_PICTURES@`（§4），后者覆盖 noctalia 的
+  `directory` / `video_directory` 与 niri 的 `screenshot-path`。
+- `theme sync` / `theme status`：Noctalia 不做的另一半 GTK 深浅同步（写
+  `gtk-{3,4}.0/settings.ini` 与 `gsettings gtk-theme`），`install`/`setup` 收尾各跑一次。
+- `wallpapers deploy|status|remove`：离线包 no-clobber 同步 + `.noctalia-mod-managed`
+  账本，清理只删账本内的条目；`setup` 顺手部署，`install` 不碰 `~/.config` 之外。
+- 模块协议新增 `MODULE_RUNTIME_WRITES`：运行时也会改写、但模块仍然拥有的文件
+  不进指纹（kitty 的两个文件、starship 的单文件目标）。
+- 操作：`list`、`check`、`setup`、`deps`、`plan`、`install`、`preset …`、`part …`、
+  `theme`、`wallpapers`、`snapshot`、`rollback`、`uninstall`、`status`。
 - 引导入口 `setup`：依赖与配置合成一份清单、一次确认、依次跑完，无参数时默认
   核心集（niri + noctalia）；`--with <程序>` 加装模块声明过的可选程序；跑完落
   一份收尾总结（装了什么、铺到哪、怎么退）。`setup` 可重复执行并收敛。
@@ -634,15 +698,77 @@ pre-rollback 保护快照"，且受保护的不占 30 个名额；保留排序�
 `MODULE_REPO_PACKAGES`。这类"shipped 工具的 import 与依赖声明不一致"目前没有
 自动校验，见 §3 已知边界。
 
+**P1-7 迁移丢掉了壁纸路径的部署期改写（已修复）**。旧引擎每次部署都会把已落地的
+`noctalia-config.toml` 里 `directory` / `video_directory` 与 niri 的 `screenshot-path`
+改写成 `$(xdg-user-dir PICTURES)` 基准（`nyxuri/deploy/templates.py:26-47`）。新项目只做
+`/home/user` → `$HOME` 替换，于是把仓库源里写死的 `/home/user/图片/Wallpapers` 原样铺成
+`$HOME/图片/Wallpapers`——`图片` 是中文 locale 的 XDG 名字，英文 locale 下不存在。
+
+**实测**：隔离 HOME 里 `install noctalia --yes` 落地的是 `$HOME/图片/Wallpapers`；本机
+`xdg-user-dir PICTURES` = `~/Pictures`、`~/图片` 不存在；而旧引擎部署在本机的真实配置
+指向 `~/Pictures/Wallpapers`，用户的 21 张壁纸与 `video/` 就在那里。后果不是报错而是
+**静默吞掉**：Noctalia 只在 `directory` 为空串时才回退 XDG Pictures，非空但无效的值原样
+生效，扫描器遇到不存在的目录只缓存一个空结果（依据是上游 `wallpaper_paths.cpp` /
+`wallpaper_scanner.cpp` 与官方文档；仓库内 `noctalia-llm-docs/` 没有覆盖这条，属外部证据）。
+
+处理方式：部署引擎加了第二个占位符 `@XDG_PICTURES@`，三处路径改用它（§4），引擎因此
+不需要知道哪个模块的哪个键要改；`pictures_dir()` 在 `xdg-user-dir` 答不出来时才回退
+`$HOME/Pictures`（与旧引擎一致）。回归测试：
+`test_xdg_pictures_placeholder_follows_the_users_pictures_dir`、
+`test_xdg_pictures_falls_back_when_the_tool_cannot_answer`。
+
+**P1-8 GTK 深浅同步没人做了（已修复）**。旧引擎的 `theme` 命令
+（`nyxuri/theme.py:67-109`）在每次部署收尾与模式切换时做两件 Noctalia 不做的事：写
+`gtk-{3,4}.0/settings.ini` 的 `gtk-application-prefer-dark-theme` / `gtk-theme-name`，
+以及 `gsettings set … gtk-theme adw-gtk3(-dark)`。Noctalia 只设 `color-scheme`
+（二进制里有 `gsettings set … color-scheme`，实测该键跟着模式走），既没有 `adw-gtk3`
+也没有 `gtk-application-prefer-dark-theme` 任何字符串；它的内置 gtk 模板写的是
+`gtk-{3,4}.0/noctalia.css`（一行 `@import` 策略），而当前 `builtin_ids` 不含 gtk3/gtk4，
+所以那条路也没在跑。
+
+**实测**：`noctalia msg theme-mode-get` = `light`、`gsettings color-scheme` =
+`prefer-light`，但 `gsettings gtk-theme` = `adw-gtk3-dark`、`settings.ini` 仍是
+`gtk-application-prefer-dark-theme = true`——三处不同步。`configs/noctalia/README.md`
+记过这个键是 Brave/Chromium 冷启动判深浅的硬依赖，不能不管。
+
+处理方式：新增 `lib/theme.sh` 与 `theme sync` / `theme status` 两个动作，`install` 与
+`setup` 的收尾各调一次，失败只警告（配置已经铺好了，不该因为 `gsettings` 或会话不可用
+把一次成功的部署弄成失败）。旧引擎的模式解析保留（部署时没有别的办法知道当前深浅），
+flock 防抖去掉——新架构没有 CLI + hook 双触发。模式切换时的实时同步留到阶段 G
+（那时二进制才真的在 PATH 上）。回归测试：`test_theme_sync_follows_the_current_mode`、
+`test_theme_sync_preserves_unrelated_settings_ini_content`、
+`test_theme_status_reports_what_is_expected`、
+`test_deploy_syncs_the_theme_without_failing_the_install`。
+
+**P1-9 Noctalia 会反向改写我们"拥有"的文件（已修复）**。Noctalia 的内置模板带
+`post_hook`，会就地改写仓库部署下去的文件：`kitty/kitty.conf`（删掉
+`# BEGIN_KITTY_THEME … # END_KITTY_THEME` 整块——仓库的 `include current-theme.conf`
+就在块里——并在文末补 `include themes/noctalia.conf`）、`kitty/themes/noctalia.conf`
+（按当前壁纸调色板整体重写）、`starship.toml`（重写 palette 块）。三个都实测过：实机
+`kitty.conf` 42 行无块，仓库版 45 行含块；主题文件与 starship 的调色板都是当前浅色值。
+
+后果是漂移必然常报。按 §1 的设计这**不是误报**——它正确地指出"漏声明了一个运行时写入
+者"；但照 §1 的老办法把 `kitty.conf` 声明成 preserve 会走向另一个极端：preserve 会把
+实机版本原样拷回暂存树，模块从此再也更新不了自己的 `kitty.conf`。
+
+处理方式：把绑在一个概念里的两件事拆开，新增 `MODULE_RUNTIME_WRITES`（§1、§4）——
+照旧覆盖更新，只是不进指纹。kitty 声明 `kitty.conf` 与 `themes/noctalia.conf`，starship
+是单文件目标，用文件名本身声明。代价写进了 §1：这些文件放弃了漂移检测，这是有意的，
+对它们报漂移只会训练用户忽略漂移报告。
+
+顺带结掉两条：§10 P1-5（全新系统上的壁纸目录）由本条的路径修正 + `wallpapers deploy`
+的 `mkdir` 一起解决——目录现在一定会被创建，Noctalia 缺目录时只显示空面板、不崩溃
+（外部证据），所以不再需要"换默认路径"或"提前做壁纸迁移"；P2 里"`colors.kdl` 没有任何
+niri 配置 include 它"的说法也不准确——`modules/niri/parts/glow/glow-material-you.kdl`
+里有 `include optional=true "colors.kdl"`，只是默认零件是 `default` 所以看不到。
+
+回归测试：`test_runtime_written_files_do_not_report_drift`、
+`test_runtime_written_files_are_still_overwritten_by_a_deploy`；
+壁纸一侧：`test_wallpaper_deploy_records_only_what_it_placed`、
+`test_wallpapers_remove_keeps_user_files_and_refuses_unsafe_entries`、
+`test_setup_deploys_wallpapers_but_install_does_not`。
+
 ### 待办（余项）
-
-#### P1-5 全新系统上的壁纸目录
-
-noctalia 配置把 `wallpaper.directory` / `video_directory` 指向
-`$HOME/图片/Wallpapers`（`/home/user` 占位符在部署时替换）。全新 CachyOS 上这个
-目录很可能不存在，而本阶段不接管壁纸管理（§11 阶段 D）。需要在阶段 B 的初始化
-验收里确认 Noctalia 在目录缺失时的行为，再决定是随模块创建空目录、换默认路径，
-还是提前做壁纸迁移。
 
 #### P2 其它
 
@@ -653,16 +779,10 @@ noctalia 配置把 `wallpaper.directory` / `video_directory` 指向
   （默认只有 niri + noctalia）。想恢复"配置在、包不在"的状态，就得显式把包从模块
   清单里拿掉，但那样 `check` 的模块自足契约也就断了。
 
-- **待验证**：Noctalia 的内置 kitty 模板是否会写进 `~/.config/kitty/`。如果会，
-  被写到的文件必须声明为 preserve，否则每次 `plan` 都会误报 drift。目前没有证据，
-  不凭猜测改声明——阶段 B 的初始化验收会暴露它（`plan` 出现 drift 即为信号）。
+- ~~待验证：Noctalia 的内置 kitty 模板是否会写进 `~/.config/kitty/`~~ → **已结案：
+  会写，而且不止 kitty**，实测见 §10 P1-9。
 
-- `colors.kdl` 被列为 preserve，但没有任何 niri 配置文件 include 它（Noctalia 渲染
-  产出，保留本身无害，但值得确认它到底该不该存在）。
 - `snapshot_restore` 逐模块恢复，中途失败不回滚已恢复的模块；回滚目前不是事务。
-- 迁移过来的 `wallpaper_picker/config.py` 里有个仓库相对回退路径
-  （`../../../..//Wallpapers`），在新目录结构下已经指不到东西；属于阶段 D 壁纸
-  迁移时一并清理的死代码。
 
 ## 11. 后续迁移顺序
 
@@ -733,13 +853,42 @@ HOME 下闭环、`check` 全绿、34 个测试通过、无 P0/P1 未关闭）都
   存放就已经能表达"某个模块的哪个变体"，再叠一层跨模块组合是空概念；真需要"一次切
   多个模块"时，`setup <模块...>` 加各自 `preset apply` 已经够用。
 
-### 阶段 D：运行时能力（下一步）
+### 阶段 D：运行时能力（已完成）
 
-- 模板渲染与主题同步（旧引擎的 `theme` 与 `_phase_render_templates`）。
-- 壁纸部署与 managed 账本，并收掉 §10 P1-5 与 P2 里的壁纸相关死代码。
-- 决定 `shell-action.sh` / `session-shell.sh` 的最终形态：新项目已去掉自研 shell
-  路由，只留 Noctalia；本阶段确认这是最终决定，而不是临时缺口。
-- 重新评估 `hooks.sh` 是否需要（若模板渲染确实需要，就在这一阶段实现）。
+先从两个只读调研收口（哪些是实测、哪些是推断见 §16.5），再按结论动手：
+
+- **模板渲染：不做（关闭）。** `templates/*` 里的 `{{ }}` 由 Noctalia 自己的
+  TemplateEngine 按 `[theme.templates.user.*]` 的 `input_path` → `output_path` 渲染
+  （本机产物里 `{{` 计数为 0，颜色跟着当前壁纸）。旧引擎的 `_phase_render_templates`
+  **从来不是模板引擎**，只是部署后对已落地文件做文本替换。`module.conf` 里"gtk.css 由
+  Noctalia 运行时渲染"的声明成立，新项目只负责把模板源铺进去。
+- **`hooks.sh`：不做（关闭）。** 没有"渲染后钩子"这种东西要模块提供；真正缺的两件事
+  （GTK 深浅同步、XDG 路径改写）是引擎的全局职责，写成模块钩子只会让每个模块重复一遍。
+  模块自己的收尾动作已经由 `MODULE_RELOAD_COMMAND` 覆盖。§3 里那条空转了两轮的概念
+  已删除；阶段 F 的 fcitx5 若需要"部署后设为默认"，届时单独设计。
+- **`shell-action.sh` / `session-shell.sh` 定稿**：只留 Noctalia 是最终决定。与旧引擎
+  逐行对照，两个脚本唯一少掉的就是自研外壳路由（读 `state.json` 的 `active_shell` /
+  `custom_shell_bin`、`NYXURI_CUSTOM_SHELL_BIN` 回退、启动失败时的 notify-send 兜底）；
+  会话 scope 清理与动作分发表逐字一致。`shell-action.sh` 保留为薄分发表：它的价值是让
+  niri 键位不直接依赖 Noctalia 子命令的拼写，而不是"可切换外壳"。
+- **不需要补**：Kvantum INI 与 `layout-{dark,light}.kdl` 切换（旧引擎的 Python 引擎本来
+  就没做，只在已死的 `theme-sync.sh` 里）、fish `fish_variables`（没有这个文件）、
+  `theme` 命令的 flock 防抖（新架构没有 CLI + hook 双触发）。
+- **补齐三处实测缺口**：§10 P1-7（`@XDG_PICTURES@` 占位符，覆盖 wallpaper /
+  video_directory / niri screenshot-path）、P1-8（`lib/theme.sh` + `theme sync`，写
+  `gtk-{3,4}.0/settings.ini` 与 `gsettings gtk-theme`，`install`/`setup` 收尾各调一次）、
+  P1-9（新增 `MODULE_RUNTIME_WRITES`，把"运行时写入"与"不要覆盖"拆开，kitty 与 starship
+  的漂移不再常报）。
+- **壁纸**：`lib/wallpaper.sh` + `wallpapers deploy|status|remove`，离线包
+  no-clobber 同步 + `<壁纸目录>/.noctalia-mod-managed` 账本 + 只删账本内条目。离线包随
+  子项目走（`assets/wallpapers/`，1 张图），远程壁纸包下载不迁——旧引擎也只把它做成
+  显式可选。只有 `setup` 会顺手部署壁纸，`install` 的契约仍是"只动 `~/.config`"。
+- **P2 里的壁纸死代码已清**：`wallpaper_picker/config.py` 那条仓库相对回退路径在任何
+  布局下都指不到东西，零行为变更地删掉（旧引擎那份源不动，随旧树一起退役）。
+
+仍然留着的取舍：`video_directory` 与 `mpvpaper` 插件在装着的 noctalia 5.2.1 上是惰性的
+（二进制里没有这两个字符串，也没有 plugins 目录），所以不为它写特殊逻辑，但也不删——
+升级后会生效。
 
 ### 阶段 E：运维与自更新
 
@@ -843,6 +992,14 @@ python3 noctalia-mod/tests/test_noctalia_mod.py -q   # 直接执行同样可以
 | 所有权指纹与 drift 检出（managed 改动、目标消失） | ✅ |
 | drift 不误报 `__custom__` / preserve / 运行时软链改动 | ✅ |
 | 依赖包记账（只记我们装的、不重复） | ✅ |
+| 部署期占位符：`@XDG_PICTURES@` 跟随 XDG、答不出来才回退 | ✅ |
+| GTK 深浅同步：settings.ini 两键、gsettings 两键、非相关键不被破坏 | ✅ |
+| 部署收尾做主题同步，且 gsettings 坏了不让部署失败 | ✅ |
+| 壁纸：离线包 no-clobber、账本只记我们放的项、幂等 | ✅ |
+| 壁纸清理：只删账本条目、拒绝越界路径且不遗忘 | ✅ |
+| `install` 不碰 `~/.config` 之外，`setup` 才部署壁纸 | ✅ |
+| 运行时写入的文件不报漂移，但仍被部署覆盖 | ✅ |
+| `MODULE_RUNTIME_WRITES` 越界路径被元数据校验拒 | ✅ |
 
 每步实现后至少运行（全部零网络秒级）：
 
@@ -855,6 +1012,11 @@ find noctalia-mod -type f \( -name '*.sh' -o -name 'noctalia-mod' \) -print0 |
 # pyc 必须重定向出仓库：__pycache__ 落在 files/ 里会被一起拷进 ~/.config。
 PYTHONPYCACHEPREFIX=${TMPDIR:-/tmp}/noctalia-mod-pycache \
     python3 -m compileall -q noctalia-mod/modules/noctalia/files/tools
+
+# 随包发布的 fish 配置同样过语法：一个语法错误就让交互 shell 起不来。
+# 需要 fish 已安装——fish 模块本来就在装它。
+find noctalia-mod/modules/fish -type f -name '*.fish' -print0 |
+    xargs -0 -n1 fish -n
 
 # 静态分析：-x 必须带，否则 source 进来的 lib 根本不参与分析。
 # 用 find 收集，不要手写 glob —— 漏掉 modules/noctalia/files/wallpaper-hook.sh
@@ -944,6 +1106,7 @@ PATH 前面（见 §16.5 的做法），否则 `setup --yes` 会真的去装包�
 | `pacman` / `paru` | 都在，但因为上一条，装包路径无法实测 |
 | 网络 | 通（GitHub 与 Arch 镜像均可达） |
 | `shellcheck` | `~/.local/bin/shellcheck`，v0.11.0 官方静态二进制；`~/.local/bin` 在默认 PATH 上 |
+| `fish` | 4.9.3，在 PATH 上（fish 模块本来就要装它），所以 `fish -n` 能进语法门禁 |
 | 沙箱 | 工作区之外只读；写 `~/.local/bin` 之类需要一次提权 |
 
 `shellcheck` 是后补装的（pacman 不可用，走官方 tar.xz 静态二进制），子项目、
@@ -959,6 +1122,8 @@ find noctalia-mod -type f \( -name '*.sh' -o -name 'noctalia-mod' \) -print0 |
     xargs -0 -n1 bash -n
 PYTHONPYCACHEPREFIX=${TMPDIR:-/tmp}/noctalia-mod-pycache \
     python3 -m compileall -q noctalia-mod/modules/noctalia/files/tools
+find noctalia-mod/modules/fish -type f -name '*.fish' -print0 |
+    xargs -0 -n1 fish -n
 
 # 2. 静态分析：-x 必须带（见 §16.4 陷阱二）
 mapfile -t shells < <(find noctalia-mod -type f -name '*.sh' | sort)
@@ -969,7 +1134,8 @@ python3 -m unittest discover -s noctalia-mod/tests -q
 noctalia-mod/bin/noctalia-mod check
 ```
 
-当前基线：语法 17 个入口全过、shellcheck 零告警、53 个测试 OK、`check` 全绿。
+当前基线：语法 17 个 shell 入口 + 随包 Python 工具 + 4 个 fish 文件全过、shellcheck
+零告警、64 个测试 OK、`check` 全绿。
 仓库根 `discover -s tests` 也能过，但**不再覆盖子项目**（测试已迁入，见 §13）。
 
 ### 16.3 当前工作区状态
@@ -1001,7 +1167,13 @@ noctalia-mod/bin/noctalia-mod check
 
 写结论前先看这张表，别把推理当既成事实。
 
-**实测过**：门禁三连、53 个测试、`check` 全绿、`deps → install → plan → uninstall`
+**实测过**（阶段 D 新增的一批都直接在实机文件上验过）：新项目部署出的壁纸路径是
+`$HOME/图片/Wallpapers` 而本机 `xdg-user-dir PICTURES` = `~/Pictures`、`~/图片` 不存在
+（§10 P1-7）；模式已是 `light` 但 `gsettings gtk-theme` 与 `gtk-3.0/settings.ini` 仍是
+dark（§10 P1-8）；Noctalia 会删掉 `kitty.conf` 的 `BEGIN_KITTY_THEME` 块并把调色板写进
+`kitty.conf` / `themes/noctalia.conf` / `starship.toml`（§10 P1-9，逐文件 `diff` 过）；
+旧引擎部署出的 `directory` 是 `/home/victorxu/Pictures/Wallpapers`（证明旧引擎的改写
+确实在跑）。**仍然是**：门禁三连、64 个测试、`check` 全绿、`deps → install → plan → uninstall`
 在假命令 + 临时 HOME 下闭环、`setup --yes` 从零到配置就位并幂等复跑（树不变、无
 暂存残留、账本不重复）、`setup --with` 的 argv 形状与未声明名字被拒、`plan niri` /
 `deps niri` 不再报别的模块的程序、drift 的四种情形（受管改动报、`__custom__`/preserve/
@@ -1013,12 +1185,18 @@ noctalia-mod/bin/noctalia-mod check
 - 真实机器上的 `deps`/`install`/`setup` 从未跑过——`sudo` 不可用，安装路径只能用
   假命令验证。所以"全新机器上能进桌面、快捷键可用、Noctalia 正常渲染"这句结论
   **还没有依据**，§11 阶段 B 的初始化验收只完成到隔离 HOME 这一层。
+- **Noctalia v5.2.1 是否真会在目录缺失时静默空面板**：依据是官方文档 + 上游源码 +
+  本机二进制字符串，**没有在真机 niri 会话里实跑**（调研是只读约束）。这条支撑着
+  §10 P1-7 的后果判断。
+- 三处 Noctalia 反向改写**会让新项目报漂移**：改写本身已实测，但"指纹会因此报警"是从
+  既有 drift 契约推出来的（`test_drift_reports_only_files_the_project_would_overwrite`
+  锁的就是"受管文件被外部改动即报 changed"），**没有在实机上跑过 `plan kitty`**——本机
+  的新项目从未部署过、状态目录里没有指纹记录；要跑就得先 `install`，那会覆盖作者真实
+  的 `~/.config`。
 - 在 niri 会话之外（TTY）跑 `setup` 会怎样：按现有契约，`niri msg action
   reload-config` 失败会导致部署回滚。这是从代码推出的结论，未在 TTY 上实测。
 - niri 是否真的会因为缺 `effects.kdl` 而拒绝加载配置：未验证。修复是防御性的
   （随包提供软链），无害但理由未经实机确认。
-- Noctalia 是否把它渲染的 kitty 主题写进 `~/.config/kitty/`：未知。如果会，被写到的
-  文件必须声明 preserve，否则 `plan` 会误报 drift。见 §10 P2。
 - §3 的程序层声明（`MODULE_REQUIRED_COMMANDS` 等）是逐脚本人工审计的结果，
   不是自动推导出来的。
 - shipped 工具的 `import` 与 `MODULE_REPO_PACKAGES` 是否一致，没有自动校验
@@ -1026,14 +1204,19 @@ noctalia-mod/bin/noctalia-mod check
 
 ### 16.6 下一步与待裁决
 
-阶段 A（基座收口）、阶段 B（全新系统初始化闭环的代码部分）与阶段 C（内容侧补齐）
-**已完成**，见 §11。下一步是**阶段 D：运行时能力**——模板渲染与主题同步、壁纸部署
-与 managed 账本，并收掉 §10 P1-5 与 P2 里的壁纸死代码。
+阶段 A（基座收口）、B（全新系统初始化闭环的代码部分）、C（内容侧补齐）与
+D（运行时能力）**已完成**，见 §11。下一步是**阶段 E：运维与自更新**——`update`、
+`doctor` 体检与 `bug` 诊断导出、`clean` 缓存清理、沙箱部署测试入口，以及把
+快照/回滚做成事务。
 
-阶段 B 已拍板的四项（`install` 默认值、可选程序交互形态、`nautilus` 定位、收尾
-总结）记在 §11，别再翻案。仍然开着的：
+阶段 B/C/D 已拍板的都记在 §11 对应阶段里，别再翻案；其中阶段 D 的四项（占位符修法、
+主题同步触发时机、运行时写入的建模、壁纸范围）在 §11 阶段 D 与 §10 P1-7…P1-9 有完整
+说明与理由。
 
-1. 仓库根 `AGENTS.md` §3 的 `bash -n` 多文件写法要不要一并修掉？（见 §16.4 陷阱一）
-2. 真实机器上的初始化验收什么时候做、在什么环境下做？（容器里 `sudo` 不可用，
-   见 §16.1）这一项不解决，"全新系统能进桌面"就一直是推理。
-3. §10 P1-5（壁纸目录缺失时 Noctalia 的行为）要在阶段 D 之前有个结论。
+仍然开着的两项（都要你定，我不动）：
+
+1. 仓库根 `AGENTS.md` §3 的 `bash -n install.sh configs/.../*.sh` 是同一个坑（只检查了
+   `install.sh`）。要不要一并修掉？见 §16.4 陷阱一。
+2. 真实机器上的初始化验收什么时候做、在什么环境下做？容器里 `sudo` 不可用（§16.1），
+   所以"全新系统能进桌面、快捷键可用、Noctalia 正常渲染"至今仍是推理。阶段 E 的
+   沙箱部署测试入口解决不了这一条——它不装真包、不进真会话。

@@ -210,7 +210,9 @@ builtin_ids = ["kitty", "qt", "starship"]
 community_ids = []
 
 # GTK Material You 主题（移植自 HyprYou，由 Noctalia 动态渲染到 gtk.css）
-# 路径中的 /home/user 为占位符，由 noctalia-mod.deploy 在部署时替换为实际 $HOME
+# 路径里的两个占位符由 noctalia-mod.deploy 在部署时替换：用户家目录、XDG 图片目录
+# （后者只用在 [wallpaper] 与 mpvpaper 的那三行）。注释里不写占位符字面量，
+# 免得部署时连注释一起被替换成一句读不通的话。
 [theme.templates.user.gtk3]
 index = 3
 input_path = "/home/user/.config/noctalia/templates/gtk-3.0.css"
@@ -234,7 +236,7 @@ input_path = "/home/user/.config/noctalia/templates/palette.toml"
 output_path = "/home/user/.cache/noctalia-mod/palette.toml"
 
 [wallpaper]
-directory = "/home/user/图片/Wallpapers"
+directory = "@XDG_PICTURES@/Wallpapers"
 fill_mode = "crop"
 
 
@@ -269,4 +271,4 @@ type = "noctalia/mpvpaper:mpvpaper"
 [plugin_settings."noctalia/mpvpaper"]
 mpv_options = "--config=no --load-scripts=no --script=~/.config/noctalia/mpv-hook.lua"
 picker_placement = "floating"
-video_directory = "/home/user/图片/Wallpapers/video"
+video_directory = "@XDG_PICTURES@/Wallpapers/video"
