@@ -92,6 +92,15 @@ doctor_check_modules() {
             doctor_line fail modules "$id: the module no longer loads"
             continue
         fi
+        # 系统级模块的判据是它自己的 status 动作（只读探测），不是配置树。
+        if module_is_system; then
+            if system_module_is_healthy "$id"; then
+                doctor_line ok modules "$id: system module reports healthy"
+            else
+                doctor_line warn modules "$id: system module reports a problem (run: noctalia-mod status $id)"
+            fi
+            continue
+        fi
         target=$(safe_target_path "$MODULE_TARGET") || {
             doctor_line fail modules "$id: unsafe target"
             continue
@@ -126,6 +135,7 @@ doctor_check_permissions() {
     shopt -s nullglob
     for id in "${enabled[@]}"; do
         module_load "$id" || continue
+        module_is_system && continue
         target=$(safe_target_path "$MODULE_TARGET") || continue
         for pattern in "${MODULE_CHMOD[@]}"; do
             for path in "$target"/$pattern; do
@@ -322,6 +332,10 @@ bug_report_write() {
         printf '\n## Deployed modules\n\n```text\n'
         while IFS= read -r id; do
             module_load "$id" || continue
+            if module_is_system; then
+                printf '%s\t-\tsystem module\n' "$id"
+                continue
+            fi
             preset=$(module_state_get "$id" preset 2>/dev/null || printf '%s' "$MODULE_PRESET_DEFAULT")
             target=$(safe_target_path "$MODULE_TARGET") || target='(unsafe target)'
             printf '%s\t%s\t%s\n' "$id" "$preset" "$target"

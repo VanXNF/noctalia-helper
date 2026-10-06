@@ -50,6 +50,9 @@ snapshot_create() {
     : > "$manifest"
     for module in "$@"; do
         module_load "$module" || { rm -rf -- "$root"; return 1; }
+        # 系统级模块没有配置树可存：它的还原点是动作脚本自己留的备份，快照管不到，
+        # 硬记一条空目标只会让 snapshot_apply 在恢复时找不到东西（PLAN §11 阶段 F）。
+        module_is_system && continue
         target=$(safe_target_path "$MODULE_TARGET") || { rm -rf -- "$root"; return 1; }
         target_relative=$MODULE_TARGET
         if [[ -e $target || -L $target ]]; then

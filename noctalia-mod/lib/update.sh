@@ -74,14 +74,35 @@ update_pull() {
 }
 
 # 用新代码重新部署：exec 一个新进程，本进程里 source 过的旧 lib 就不再参与。
+#
+# 系统级模块里需要 root 的那些（greeter 会写 /etc、切换显示管理器）不在这里重跑：
+# 更新代码不该顺手改掉这台机器下次开机登录的样子，那是用户显式做的决定。它们会被告知
+# 怎么重跑，其余模块照旧重铺。
 update_reexec_install() {
-    local -a modules=() argv=()
+    local id
+    local -a modules=() argv=() config=() system=() manual=()
     mapfile -t modules < <(state_enabled_modules)
     ((${#modules[@]})) || {
         log 'nothing is deployed yet; run: noctalia-mod setup'
         return 0
     }
-    argv=(install "${modules[@]}")
+    for id in "${modules[@]}"; do
+        module_load "$id" || {
+            warn "skipping $id: the module no longer loads"
+            continue
+        }
+        if ! module_is_system; then
+            config+=("$id")
+        elif [[ ${MODULE_SYSTEM_PRIVILEGED:-no} == yes ]]; then
+            manual+=("$id")
+        else
+            system+=("$id")
+        fi
+    done
+    ((${#manual[@]})) &&
+        log "left alone (needs an explicit run): $(join_by ' ' "${manual[@]}") — re-apply with: noctalia-mod install <module>"
+    ((${#config[@]} || ${#system[@]})) || return 0
+    argv=(install "${config[@]}" "${system[@]}")
     [[ ${UPDATE_ASSUME_YES:-no} == yes ]] && argv+=(--yes)
     exec "$NOCTALIA_MOD_ENTRY" "${argv[@]}"
 }

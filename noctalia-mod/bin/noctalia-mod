@@ -24,6 +24,8 @@ source "$NOCTALIA_MOD_ROOT/lib/module-loader.sh"
 source "$NOCTALIA_MOD_ROOT/lib/package-manager.sh"
 # shellcheck source=../lib/deploy.sh
 source "$NOCTALIA_MOD_ROOT/lib/deploy.sh"
+# shellcheck source=../lib/system.sh
+source "$NOCTALIA_MOD_ROOT/lib/system.sh"
 # shellcheck source=../lib/preset.sh
 source "$NOCTALIA_MOD_ROOT/lib/preset.sh"
 # shellcheck source=../lib/theme.sh
@@ -55,6 +57,7 @@ Usage:
   noctalia-mod preset <module> list
   noctalia-mod preset <module> apply|save|edit|delete <name> [--yes]
   noctalia-mod part <module> <slot> list|apply <name> [--yes]
+  noctalia-mod action <module> <name>
   noctalia-mod theme sync|status
   noctalia-mod wallpapers [deploy|status|remove]
   noctalia-mod snapshot [note]
@@ -66,14 +69,28 @@ Usage:
   noctalia-mod bug
   noctalia-mod clean [-n] [--snapshots]
   noctalia-mod test
-  noctalia-mod status
+  noctalia-mod status [module ...]
+
+System modules (fcitx5, fisher, greeter) write outside ~/.config, so they are
+never selected implicitly: name them, e.g. `noctalia-mod install greeter`.
 USAGE
+}
+
+# 不带参数时的默认模块集合：**只**是配置模块。系统级模块一律要点名——它们写 /etc、
+# 开关 systemd 单元、把别的显示管理器关掉，不该由"我什么都没写"触发。`plan`/`deps`/
+# `install` 共用这条规矩（PLAN §11 阶段 F）。
+default_modules() {
+    local id
+    while IFS= read -r id; do
+        module_load "$id" || continue
+        module_is_system || printf '%s\n' "$id"
+    done < <(module_ids)
 }
 
 resolve_modules() {
     local -a requested=("$@")
     if ((${#requested[@]} == 0)); then
-        mapfile -t requested < <(module_ids)
+        mapfile -t requested < <(default_modules)
     fi
     ((${#requested[@]})) || { error 'no modules are available'; return 1; }
     local id
@@ -141,10 +158,24 @@ print_aur_helper_if_needed() {
 }
 
 # 配置部署清单（PLAN §5 第 4 步）：会覆盖什么、保留什么、reload 什么、有没有漂移。
+# 系统级模块列出的是另一套东西：它会写哪些配置根之外的路径、enable 哪个单元、要不要 root。
 print_module_lines() {
     local id target owner preserve recorded_fingerprint
     for id in "$@"; do
         module_load "$id"
+        if module_is_system; then
+            owner=external
+            [[ $(module_state_get "$id" enabled 2>/dev/null || true) == 1 ]] && owner=managed
+            printf 'module\t%s\tsystem\t%s\n' "$id" "$owner"
+            for preserve in "${MODULE_SYSTEM_PATHS[@]}"; do
+                printf 'write\t%s\t%s\n' "$id" "$preserve"
+            done
+            for preserve in "${MODULE_SYSTEM_SERVICES[@]}"; do
+                printf 'service\t%s\t%s\n' "$id" "$preserve"
+            done
+            [[ ${MODULE_SYSTEM_PRIVILEGED:-no} == yes ]] && printf 'privilege\t%s\tsudo\n' "$id"
+            continue
+        fi
         target=$(safe_target_path "$MODULE_TARGET")
         owner=external
         [[ $(module_state_get "$id" enabled 2>/dev/null || true) == 1 ]] && owner=managed
@@ -361,12 +392,57 @@ record_installed_packages() {
     return 0
 }
 
-cmd_list() {
+# 选定的模块按形状分两拨：配置模块走原子部署与快照，系统级模块走动作脚本（PLAN §11
+# 阶段 F）。快照只能救配置树，所以这两拨必须分开——混在一起会让系统模块在快照里
+# 留下一条没有目标可恢复的记录。
+CONFIG_MODULES=()
+SYSTEM_MODULES=()
+
+partition_modules() {
     local id
+    CONFIG_MODULES=()
+    SYSTEM_MODULES=()
+    for id in "$@"; do
+        module_load "$id" || return 1
+        if module_is_system; then
+            SYSTEM_MODULES+=("$id")
+        else
+            CONFIG_MODULES+=("$id")
+        fi
+    done
+}
+
+# 系统级模块的账本只记"装过、成功、哪个版本"：没有目标树、没有指纹、没有零件与预设，
+# 多写一个字段就多一个将来会撒谎的字段。
+record_system_modules() {
+    local id
+    for id in "$@"; do
+        module_state_write "$id" \
+            kind system \
+            enabled 1 \
+            source_version "$(state_project_version)" \
+            last_result success
+    done
+}
+
+# 需要 root 的系统级模块：在装包之前一次性取权限，别让动作跑到一半才弹 sudo。
+preflight_system_privileges() {
+    (($#)) || return 0
+    system_modules_need_privileges "$@" || return 0
+    preflight_sudo
+}
+
+cmd_list() {
+    local id target
     printf 'module\ttarget\n'
     while IFS= read -r id; do
         module_load "$id"
-        printf '%s\t%s\n' "$id" "$MODULE_TARGET"
+        if module_is_system; then
+            target=system
+        else
+            target=$MODULE_TARGET
+        fi
+        printf '%s\t%s\n' "$id" "$target"
     done < <(module_ids)
 }
 
@@ -453,25 +529,45 @@ cmd_install() {
     require_consistent_references || return 1
     print_plan "${modules[@]}"
     confirm_plan "$yes" || return 1
+    partition_modules "${modules[@]}" || return 1
+    preflight_system_privileges "${SYSTEM_MODULES[@]}" || return 1
     install_dependencies || return 1
     record_installed_packages
-    local snapshot id
-    snapshot=$(snapshot_create auto "before install: $(join_by ',' "${modules[@]}")" "${modules[@]}") || return 1
-    for id in "${modules[@]}"; do
+    local snapshot='' id
+    local -a transaction=()
+    if ((${#CONFIG_MODULES[@]})); then
+        snapshot=$(snapshot_create auto "before install: $(join_by ',' "${CONFIG_MODULES[@]}")" "${CONFIG_MODULES[@]}") || return 1
+        transaction=("${CONFIG_MODULES[@]}")
+    fi
+    # 顺序是有意的：配置先、系统动作后。系统动作失败时配置能整体退回快照；反过来配置
+    # 失败时系统侧已经没有可退的东西，所以两边都把配置放在前面。系统动作自己的备份与
+    # 回滚由它负责——那部分引擎管不到（PLAN §11 阶段 F）。
+    for id in "${CONFIG_MODULES[@]}"; do
         if ! module_deploy "$id" "$part_slot"; then
             error "deployment failed for $id; restoring $snapshot"
-            snapshot_restore "$snapshot" no "${modules[@]}" || error 'automatic restore failed; inspect the snapshot before retrying'
+            snapshot_restore "$snapshot" no "${transaction[@]}" || error 'automatic restore failed; inspect the snapshot before retrying'
             return 1
         fi
     done
-    record_modules "$snapshot" "${modules[@]}"
+    for id in "${SYSTEM_MODULES[@]}"; do
+        if ! system_module_install "$id"; then
+            if [[ -n $snapshot ]]; then
+                error "system module $id failed; restoring $snapshot"
+                snapshot_restore "$snapshot" no "${transaction[@]}" || error 'automatic restore failed; inspect the snapshot before retrying'
+            fi
+            return 1
+        fi
+    done
+    record_modules "$snapshot" "${CONFIG_MODULES[@]}"
+    record_system_modules "${SYSTEM_MODULES[@]}"
     state_append_audit install "$(join_by ',' "${modules[@]}")"
     # 冻结的模块这次一个字节都没动，不能算进"已安装"里。
     local -a deployed=()
-    for id in "${modules[@]}"; do
+    for id in "${CONFIG_MODULES[@]}"; do
         contains_word "$id" "${MODULE_DEPLOY_FROZEN[@]}" || deployed+=("$id")
     done
     ((${#MODULE_DEPLOY_FROZEN[@]})) && warn "left as is (preset missing): $(join_by ', ' "${MODULE_DEPLOY_FROZEN[@]}")"
+    deployed+=("${SYSTEM_MODULES[@]}")
     ((${#deployed[@]})) && log "installed: $(join_by ', ' "${deployed[@]}")"
     finish_deploy
     return 0
@@ -497,6 +593,11 @@ print_setup_summary() {
     fi
     for id in "${modules[@]}"; do
         module_load "$id"
+        if module_is_system; then
+            # 系统级模块没有配置树可以回滚，退路是它自己的卸载动作；说清楚是哪一条。
+            printf 'applied\t%s\tsystem module (undo: noctalia-mod uninstall %s)\n' "$id" "$id"
+            continue
+        fi
         target=$(safe_target_path "$MODULE_TARGET")
         if contains_word "$id" "${MODULE_DEPLOY_FROZEN[@]}"; then
             printf 'frozen\t%s\t%s\n' "$id" "$(module_state_get "$id" preset 2>/dev/null || true)"
@@ -539,6 +640,7 @@ cmd_setup() {
     collect_packages "${modules[@]}"
     resolve_optional_programs "${modules[@]}" || return 1
     print_setup_plan "${modules[@]}"
+    partition_modules "${modules[@]}" || return 1
     mapfile -t missing_repo < <(package_missing "${PLAN_REPO_PACKAGES[@]}")
     mapfile -t missing_aur < <(package_missing "${PLAN_AUR_PACKAGES[@]}")
     if ((${#missing_repo[@]} || ${#missing_aur[@]})); then
@@ -546,6 +648,7 @@ cmd_setup() {
     else
         confirm_plan "$yes" 'Deploy the configuration?' || return 1
     fi
+    preflight_system_privileges "${SYSTEM_MODULES[@]}" || return 1
     install_dependencies || return 1
     record_installed_packages
     if ((${#PLAN_INSTALLED_REPO[@]} || ${#PLAN_INSTALLED_AUR[@]})); then
@@ -553,16 +656,30 @@ cmd_setup() {
     else
         log 'nothing to install'
     fi
-    local snapshot id
-    snapshot=$(snapshot_create auto "before setup: $(join_by ',' "${modules[@]}")" "${modules[@]}") || return 1
-    for id in "${modules[@]}"; do
+    local snapshot='' id
+    local -a transaction=()
+    if ((${#CONFIG_MODULES[@]})); then
+        snapshot=$(snapshot_create auto "before setup: $(join_by ',' "${CONFIG_MODULES[@]}")" "${CONFIG_MODULES[@]}") || return 1
+        transaction=("${CONFIG_MODULES[@]}")
+    fi
+    for id in "${CONFIG_MODULES[@]}"; do
         if ! module_deploy "$id"; then
             error "deployment failed for $id; restoring $snapshot"
-            snapshot_restore "$snapshot" no "${modules[@]}" || error 'automatic restore failed; inspect the snapshot before retrying'
+            snapshot_restore "$snapshot" no "${transaction[@]}" || error 'automatic restore failed; inspect the snapshot before retrying'
             return 1
         fi
     done
-    record_modules "$snapshot" "${modules[@]}"
+    for id in "${SYSTEM_MODULES[@]}"; do
+        if ! system_module_install "$id"; then
+            if [[ -n $snapshot ]]; then
+                error "system module $id failed; restoring $snapshot"
+                snapshot_restore "$snapshot" no "${transaction[@]}" || error 'automatic restore failed; inspect the snapshot before retrying'
+            fi
+            return 1
+        fi
+    done
+    record_modules "$snapshot" "${CONFIG_MODULES[@]}"
+    record_system_modules "${SYSTEM_MODULES[@]}"
     state_append_audit setup "$(join_by ',' "${modules[@]}")"
     finish_deploy
     # 壁纸是用户可见的数据、在 ~/.config 之外，所以只有引导路径（从零到桌面）碰它；
@@ -571,11 +688,17 @@ cmd_setup() {
     wallpaper_report=$(wallpaper_deploy) || warn 'wallpaper deploy failed; the wallpaper directory may be empty'
     print_setup_summary "${modules[@]}"
     [[ -n $wallpaper_report ]] && printf '%s\n' "$wallpaper_report"
+    return 0
 }
 
 cmd_preset() {
     local id=${1-} action=${2-} name=${3-} yes=no option install_rc=0
     [[ -n $id && -n $action ]] || { usage; return 2; }
+    module_load "$id" || return 1
+    module_is_system && {
+        error "module $id is a system module; it has no presets"
+        return 1
+    }
     case $action in
         list)
             [[ $# -eq 2 ]] || { error 'preset list does not accept extra arguments'; return 2; }
@@ -654,6 +777,10 @@ cmd_part() {
     local id=${1-} slot=${2-} action=${3-} name=${4-} yes=no option install_rc=0
     [[ -n $id && -n $slot && -n $action ]] || { usage; return 2; }
     module_load "$id"
+    module_is_system && {
+        error "module $id is a system module; it has no parts"
+        return 1
+    }
     contains_word "$slot" "${MODULE_PARTS[@]}" || { error "unknown part slot: $slot"; return 1; }
     case $action in
         list)
@@ -709,7 +836,7 @@ cmd_snapshot() {
             local -a modules=()
             mapfile -t modules < <(state_enabled_modules)
             if ((${#modules[@]} == 0)); then
-                mapfile -t modules < <(module_ids)
+                mapfile -t modules < <(default_modules)
             fi
             local id
             id=$(snapshot_create manual "${1-}" "${modules[@]}") || return 1
@@ -732,7 +859,7 @@ cmd_rollback() {
 }
 
 cmd_uninstall() {
-    local yes=no arg id snapshot
+    local yes=no arg id snapshot path
     local -a requested=() modules=()
     for arg in "$@"; do
         case $arg in
@@ -751,10 +878,28 @@ cmd_uninstall() {
     printf 'Noctalia Mod uninstall\n'
     for id in "${modules[@]}"; do
         module_load "$id"
+        if module_is_system; then
+            printf 'remove\t%s\tsystem module\n' "$id"
+            for path in "${MODULE_SYSTEM_PATHS[@]}"; do
+                printf 'path\t%s\t%s\n' "$id" "$path"
+            done
+            continue
+        fi
         printf 'remove\t%s\t%s\n' "$id" "$(safe_target_path "$MODULE_TARGET")"
     done
     confirm_plan "$yes" || return 1
     for id in "${modules[@]}"; do
+        module_load "$id" || return 1
+        if module_is_system; then
+            # 账本里没记过就当没装过：直接跑卸载动作反而可能去动这台机器上别人配好的东西。
+            if [[ $(module_state_get "$id" enabled 2>/dev/null || true) != 1 ]]; then
+                warn "system module $id is not recorded as installed; nothing to remove"
+                continue
+            fi
+            system_module_uninstall "$id" || return 1
+            module_state_remove "$id"
+            continue
+        fi
         snapshot=$(snapshot_for_module "$id")
         if [[ -n $snapshot ]] && snapshot_exists "$snapshot"; then
             # 这里用不带事务包装的原语：卸载逐模块恢复，而单个模块的替换本身就是原子的，
@@ -776,10 +921,12 @@ cmd_uninstall() {
     log "uninstalled: $(join_by ', ' "${modules[@]}")"
 }
 
-# GTK 深浅同步（PLAN §10 P1-8）。部署收尾调一次，失败只警告：配置已经铺好了，
+# GTK 收尾（PLAN §10 P1-8、§11 阶段 F）。部署收尾各跑一次，失败只警告：配置已经铺好了，
 # 不该因为 gsettings 或会话不可用就把一次成功的部署弄成失败。
 finish_deploy() {
     theme_sync >/dev/null || warn 'theme sync failed; GTK apps may not follow the current mode'
+    theme_clean_legacy_overrides >/dev/null || warn 'could not remove the legacy gtk-dark.css override'
+    theme_trigger_render
     return 0
 }
 
@@ -822,16 +969,79 @@ cmd_wallpapers() {
     esac
 }
 
+# 不带参数是一张总表；点名模块时，配置模块仍打一行，系统级模块把自己那份只读探测
+# 原样打出来——它的状态不是一行能说完的（包装没装、单元开没开、主题激活没激活都算），
+# 而那份探测是模块自己的事，引擎不替它总结（PLAN §11 阶段 F）。
 cmd_status() {
-    local id
-    printf 'module\tstatus\tpreset\ttarget\n'
-    while IFS= read -r id; do
-        module_load "$id"
+    local -a requested=("$@") modules=()
+    local id rc=0
+    if ((${#requested[@]})); then
+        modules=("${requested[@]}")
+    else
+        mapfile -t modules < <(module_ids)
+        printf 'module\tstatus\tpreset\ttarget\n'
+    fi
+    for id in "${modules[@]}"; do
+        module_load "$id" || return 1
+        if module_is_system; then
+            if ((${#requested[@]})); then
+                # 只看退出码：不健康（缺文件、单元没开）就是非零，报告本身照常打出来。
+                system_module_run_action "$id" status || rc=1
+            else
+                printf '%s\t%s\t-\tsystem\n' "$id" \
+                    "$(module_state_get "$id" enabled 2>/dev/null || printf absent)"
+            fi
+            continue
+        fi
         printf '%s\t%s\t%s\t%s\n' "$id" \
             "$(module_state_get "$id" enabled 2>/dev/null || printf absent)" \
             "$(module_state_get "$id" preset 2>/dev/null || printf '%s' "$MODULE_PRESET_DEFAULT")" \
             "$(safe_target_path "$MODULE_TARGET")"
-    done < <(module_ids)
+    done
+    return "$rc"
+}
+
+# 系统级模块的额外动作（fcitx5 的 deploy / activate，PLAN §11 阶段 F）。三件套之外
+# 的东西都从这里走：命令行只能点名模块声明过的动作，跟 --with 只认声明过的可选程序
+# 是同一条规矩。
+cmd_action() {
+    local id=${1-} name=${2-} yes=no option
+    [[ -n $id && -n $name ]] || { usage; return 2; }
+    shift 2
+    for option in "$@"; do
+        case $option in
+            --yes | --express) yes=yes ;;
+            *) error "unknown action option: $option"; return 2 ;;
+        esac
+    done
+    module_load "$id" || return 1
+    module_is_system || {
+        error "module $id is not a system module; it has no actions"
+        return 1
+    }
+    case $name in
+        install | uninstall)
+            error "$name is a top-level command; run: noctalia-mod $name $id"
+            return 2
+            ;;
+        status)
+            system_module_run_action "$id" status
+            return $?
+            ;;
+    esac
+    contains_word "$name" "${MODULE_SYSTEM_EXTRA_ACTIONS[@]}" || {
+        error "module $id has no action named $name"
+        ((${#MODULE_SYSTEM_EXTRA_ACTIONS[@]})) &&
+            printf 'available: %s\n' "$(join_by ' ' "${MODULE_SYSTEM_EXTRA_ACTIONS[@]}")" >&2
+        return 2
+    }
+    [[ $(module_state_get "$id" enabled 2>/dev/null || true) == 1 ]] || {
+        error "module $id is not installed yet; run: noctalia-mod install $id"
+        return 1
+    }
+    NOCTALIA_MOD_ASSUME_YES=$yes system_module_run_action "$id" "$name" || return 1
+    state_append_audit "action" "$id/$name"
+    return 0
 }
 
 cmd_doctor() {
@@ -907,6 +1117,7 @@ main() {
         install) with_project_lock cmd_install "$@" ;;
         preset) with_project_lock cmd_preset "$@" ;;
         part) with_project_lock cmd_part "$@" ;;
+        action) with_project_lock cmd_action "$@" ;;
         theme) cmd_theme "$@" ;;
         wallpapers) with_project_lock cmd_wallpapers "$@" ;;
         snapshot) with_project_lock cmd_snapshot "$@" ;;

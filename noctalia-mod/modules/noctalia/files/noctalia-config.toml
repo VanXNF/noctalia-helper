@@ -209,6 +209,30 @@ wallpaper_scheme = "m3-content"
 builtin_ids = ["kitty", "qt", "starship"]
 community_ids = []
 
+# NyxMellow 动态 fcitx5 皮肤（mellow 形状 + Material You 自动取色）。
+# 素材由 fcitx5 模块部署到 fcitx5 的主题目录，注册留在这里：Noctalia 读的是本文件，
+# 而 requires_path 让这一组在没装皮肤时自动跳过——于是 fcitx5 模块不必去改写别人的
+# 配置文件，卸载皮肤也不会留下指向空路径的注册（PLAN §11 阶段 F）。路径里的占位符
+# 由部署引擎替换成真实家目录，写法见下面 GTK 那段的说明。
+[theme.templates.user.nyxmellow_theme]
+index = 0
+input_path = "/home/user/.local/share/fcitx5/themes/nyxmellow/templates/theme.conf"
+output_path = "/home/user/.local/share/fcitx5/themes/nyxmellow/theme.conf"
+requires_path = "/home/user/.local/share/fcitx5/themes/nyxmellow/templates/theme.conf"
+
+[theme.templates.user.nyxmellow_panel]
+index = 1
+input_path = "/home/user/.local/share/fcitx5/themes/nyxmellow/templates/panel.svg"
+output_path = "/home/user/.local/share/fcitx5/themes/nyxmellow/panel.svg"
+requires_path = "/home/user/.local/share/fcitx5/themes/nyxmellow/templates/panel.svg"
+
+[theme.templates.user.nyxmellow_highlight]
+index = 2
+input_path = "/home/user/.local/share/fcitx5/themes/nyxmellow/templates/highlight.svg"
+output_path = "/home/user/.local/share/fcitx5/themes/nyxmellow/highlight.svg"
+requires_path = "/home/user/.local/share/fcitx5/themes/nyxmellow/templates/highlight.svg"
+post_hook = "busctl --user --auto-start=no call org.fcitx.Fcitx5 /controller org.fcitx.Fcitx.Controller1 ReloadAddonConfig s classicui >/dev/null 2>&1 || true"
+
 # GTK Material You 主题（移植自 HyprYou，由 Noctalia 动态渲染到 gtk.css）
 # 路径里的两个占位符由 noctalia-mod.deploy 在部署时替换：用户家目录、XDG 图片目录
 # （后者只用在 [wallpaper] 与 mpvpaper 的那三行）。注释里不写占位符字面量，

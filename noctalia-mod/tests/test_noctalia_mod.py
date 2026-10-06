@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import hashlib
 import shutil
 import subprocess
 from pathlib import Path
@@ -51,11 +52,62 @@ printf '\\n' >> \"$FAKE_LOG\"
             + "[[ ${1-} == -Q ]] && exit 1\n"
             + "exit 0\n"
         )
+        # rime_deployer 的替身：真实的那份会真的去编译方案，测试要的是"编译这一步被
+        # 走到"。--set-active-schema 按相对路径写 user.yaml，所以它跑在哪个目录是要验的。
+        (fake_bin / "rime_deployer").write_text(
+            common
+            + 'if [[ ${1-} == --set-active-schema ]]; then printf \'cwd %s\\n\' "$PWD" >> "$FAKE_LOG"; fi\n'
+            + "exit 0\n"
+        )
         (fake_bin / "sudo").write_text(
             common
             + 'if [[ ${1-} == -v ]]; then exit 0; fi\n'
-            + 'exec "$@"\n'
+            # -n/-o/-g 是 sudo 自己的选项，在这里没有意义（测试不是 root）；
+            # 去掉它们，剩下的照原样执行。
+            + 'args=()\n'
+            + 'while (($#)); do\n'
+            + '    case $1 in\n'
+            + '        -n) shift ;;\n'
+            + '        -o | -g) shift 2 ;;\n'
+            + '        *) args+=("$1"); shift ;;\n'
+            + '    esac\n'
+            + 'done\n'
+            + 'exec "${args[@]}"\n'
         )
+        # systemd 替身：enabled 状态落在一个文件里，测试可以预置与断言。
+        # FAKE_SYSTEMCTL_FAIL 让某一步失败，用来验证回滚路径。
+        (fake_bin / "systemctl").write_text(
+            common
+            + 'state="${FAKE_SYSTEMD_STATE:-/dev/null}"\n'
+            + 'action=${1-}; shift || true\n'
+            + 'args=()\n'
+            + 'for arg in "$@"; do [[ $arg == --force || $arg == -- ]] && continue; args+=("$arg"); done\n'
+            + 'unit=${args[0]-}\n'
+            + 'case $action in\n'
+            + '    cat) exit 0 ;;\n'
+            + '    is-enabled)\n'
+            + '        [[ ${FAKE_SYSTEMCTL_FAIL:-} == "is-enabled:$unit" ]] && exit 1\n'
+            + '        grep -qx -- "$unit" "$state" 2>/dev/null\n'
+            + '        ;;\n'
+            + '    enable)\n'
+            + '        [[ ${FAKE_SYSTEMCTL_FAIL:-} == "enable:$unit" ]] && exit 1\n'
+            + '        grep -qx -- "$unit" "$state" 2>/dev/null || printf \'%s\\n\' "$unit" >> "$state"\n'
+            + '        ;;\n'
+            + '    disable)\n'
+            + '        [[ ${FAKE_SYSTEMCTL_FAIL:-} == "disable:$unit" ]] && exit 1\n'
+            + '        grep -vx -- "$unit" "$state" > "$state.tmp" 2>/dev/null || true\n'
+            + '        mv -- "$state.tmp" "$state"\n'
+            + '        ;;\n'
+            + 'esac\n'
+        )
+        # AUR helper 的替身单独放一层：只想验证"没有 helper 就不装 repo 包"的用例
+        # 自己拼 PATH，不会意外捡到它。
+        aur_bin = fake_bin / "aur-helper"
+        aur_bin.mkdir()
+        for name in ("paru", "yay"):
+            (aur_bin / name).write_text(common + "exit 0\n")
+        for path in aur_bin.iterdir():
+            path.chmod(0o755)
         for path in fake_bin.iterdir():
             path.chmod(0o755)
         return fake_bin, log
@@ -77,7 +129,7 @@ printf '\\n' >> \"$FAKE_LOG\"
                 "XDG_CACHE_HOME": str(env.home / ".cache"),
                 "XDG_RUNTIME_DIR": str(env.home / "runtime"),
                 "FAKE_LOG": str(env.home / "commands.log"),
-                "PATH": f"{fake_bin}:{child_env['PATH']}",
+                "PATH": f"{fake_bin}:{fake_bin / 'aur-helper'}:{child_env['PATH']}",
             }
         )
         if extra_env:
@@ -2097,6 +2149,591 @@ printf '\\n' >> \"$FAKE_LOG\"
                 result = self._lib_run(env, script, NOCTALIA_MOD_ROOT=str(root))
                 self.assertNotEqual(result.returncode, 0, label)
                 self.assertIn(expected, result.stderr, label)
+
+    # ── 系统级可选模块（PLAN §11 阶段 F）─────────────────────────────────────────
+    #
+    # 这一组的隔离手段比配置模块多一层：系统级模块会写 /etc、建 /var/lib、开关 systemd
+    # 单元，greeter 还要求 /usr/bin 下有一个 root 拥有的可执行文件。测试不能碰这些真东西，
+    # 所以需要它们的用例跑在一份"补丁过的项目副本"上：bin/lib/modules 逐字节复制，只把
+    # greeter 的绝对路径重定向进沙箱，并把信任检查换成替身（真检查的拒绝行为另有用例，
+    # 走真实代码）。
+
+    def _system_tree(self, tmp: str) -> Path:
+        tree = Path(tmp) / "noctalia-mod"
+        shutil.copytree(PROJECT, tree)
+        return tree
+
+    def _redirect_greeter_paths(self, tree: Path, root: Path) -> None:
+        conf = tree / "modules" / "greeter" / "module.conf"
+        text = conf.read_text(encoding="utf-8")
+        for path in ("/etc/greetd", "/etc/polkit-1", "/var/lib/noctalia-greeter"):
+            text = text.replace(path, f"{root}{path}")
+        conf.write_text(text, encoding="utf-8")
+
+    def _stub_trusted_executable(self, tree: Path) -> None:
+        with (tree / "lib" / "system.sh").open("a", encoding="utf-8") as handle:
+            handle.write(
+                "\nsystem_trusted_executable() {\n"
+                "    local candidate=${1-}\n"
+                '    [[ -n $candidate && -x $candidate ]] || return 1\n'
+                "    printf '%s\\n' \"$(readlink -f -- \"$candidate\")\"\n"
+                "}\n"
+            )
+
+    def _greeter_shims(self, fake_bin: Path) -> None:
+        (fake_bin / "noctalia-greeter-session").write_text("#!/bin/sh\nexit 0\n")
+        (fake_bin / "noctalia-greeter").write_text(
+            "#!/bin/sh\n[[ ${1-} == sessions ]] && printf 'niri\\n'\nexit 0\n"
+        )
+        (fake_bin / "greetd").write_text("#!/bin/sh\nexit 0\n")
+        # greeter 声明了 AUR 包：没有 helper 时依赖阶段会拒绝，这不是本用例要测的东西。
+        (fake_bin / "paru").write_text("#!/bin/sh\nexit 0\n")
+        for name in ("noctalia-greeter-session", "noctalia-greeter", "greetd", "paru"):
+            (fake_bin / name).chmod(0o755)
+
+    def test_system_modules_are_never_selected_implicitly(self) -> None:
+        """写 /etc、切换显示管理器的事不该由"我什么都没写"触发（PLAN §11 阶段 F）。"""
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            listed = self._run(env, fake_bin, "list")
+            self.assertIn("fcitx5\tsystem", listed.stdout)
+            self.assertIn("greeter\tsystem", listed.stdout)
+
+            planned = self._run(env, fake_bin, "plan")
+            self.assertEqual(planned.returncode, 0, planned.stderr)
+            for module in ("fcitx5", "fisher", "greeter"):
+                self.assertNotIn(f"module\t{module}\t", planned.stdout)
+
+            installed = self._run(env, fake_bin, "install", "--yes")
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            state = env.home / ".local" / "state" / "noctalia-mod" / "modules"
+            self.assertFalse((state / "greeter.state").exists())
+            self.assertFalse((state / "fisher.state").exists())
+            self.assertFalse((env.home / ".config" / "fcitx5").exists())
+
+    def test_fcitx5_installs_activates_and_uninstalls(self) -> None:
+        with TempEnv() as env:
+            fake_bin, log = self._fake_commands(env)
+            installed = self._run(env, fake_bin, "install", "fcitx5", "--yes")
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+
+            theme = env.home / ".local" / "share" / "fcitx5" / "themes" / "nyxmellow"
+            self.assertTrue((theme / "templates" / "theme.conf").is_file())
+            self.assertTrue((theme / "templates" / "panel.svg").is_file())
+            classicui = env.home / ".config" / "fcitx5" / "conf" / "classicui.conf"
+            self.assertIn("Theme=nyxmellow", classicui.read_text(encoding="utf-8"))
+            profile = (env.home / ".config" / "fcitx5" / "profile").read_text(encoding="utf-8")
+            self.assertIn("Name=rime", profile)
+            custom = env.home / ".local" / "share" / "fcitx5" / "rime" / "default.custom.yaml"
+            self.assertIn("schema: rime_ice", custom.read_text(encoding="utf-8"))
+            # --set-active-schema 写的是相对路径：它必须在 rime 目录里跑，否则文件会
+            # 落在调用者的 cwd 里。
+            self.assertIn(f"cwd {custom.parent}", log.read_text(encoding="utf-8"))
+            self.assertFalse((PROJECT / "user.yaml").exists())
+
+            # 系统模块的账本只记"装过、成功、哪个版本"：没有目标树就没有指纹与预设。
+            ledger = (
+                env.home / ".local" / "state" / "noctalia-mod" / "modules" / "fcitx5.state"
+            ).read_text(encoding="utf-8")
+            self.assertIn("kind\tsystem", ledger)
+            self.assertIn("enabled\t1", ledger)
+            self.assertIn("last_result\tsuccess", ledger)
+            self.assertNotIn("target\t", ledger)
+            self.assertNotIn("fingerprint\t", ledger)
+
+            removed = self._run(env, fake_bin, "uninstall", "fcitx5", "--yes")
+            self.assertEqual(removed.returncode, 0, removed.stderr)
+            self.assertFalse((theme / "templates" / "theme.conf").exists())
+            self.assertFalse(classicui.exists(), "a file we created must not survive as an empty shell")
+            self.assertFalse(
+                (env.home / ".local" / "state" / "noctalia-mod" / "modules" / "fcitx5.state").exists()
+            )
+
+    def test_fcitx5_keeps_the_users_own_theme_choice(self) -> None:
+        """素材部署与"设为默认"解耦：卸载只还原我们改过的那两个值。"""
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            classicui = env.home / ".config" / "fcitx5" / "conf" / "classicui.conf"
+            classicui.parent.mkdir(parents=True)
+            classicui.write_text("# mine\n[ClassicUI]\nTheme=mytheme\n", encoding="utf-8")
+
+            installed = self._run(env, fake_bin, "install", "fcitx5", "--yes")
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            active = classicui.read_text(encoding="utf-8")
+            self.assertIn("Theme=nyxmellow", active)
+            self.assertIn("# mine", active)
+
+            # 再跑一次"只铺素材"：它不该动当前主题选择。
+            redeployed = self._run(env, fake_bin, "action", "fcitx5", "deploy")
+            self.assertEqual(redeployed.returncode, 0, redeployed.stderr)
+            self.assertEqual(classicui.read_text(encoding="utf-8"), active)
+
+            removed = self._run(env, fake_bin, "uninstall", "fcitx5", "--yes")
+            self.assertEqual(removed.returncode, 0, removed.stderr)
+            restored = classicui.read_text(encoding="utf-8")
+            self.assertIn("Theme=mytheme", restored)
+            self.assertIn("# mine", restored)
+            self.assertNotIn("nyxmellow", restored)
+
+    def test_fcitx5_rime_fallback_leaves_an_existing_user_yaml_alone(self) -> None:
+        with TempEnv() as env:
+            user_yaml = env.home / "user.yaml"
+            script = (
+                f"source {PROJECT / 'lib/common.sh'}; "
+                f"source {PROJECT / 'lib/paths.sh'}; "
+                f"source {PROJECT / 'lib/module-loader.sh'}; "
+                f"source {PROJECT / 'lib/system.sh'}; "
+                f"source {PROJECT / 'modules/fcitx5/actions/_common.sh'}; "
+                f"rime_remember_selection {user_yaml}"
+            )
+            fresh = self._lib_run(
+                env, script, NOCTALIA_MOD_ID="fcitx5", NOCTALIA_MOD_ROOT=str(PROJECT)
+            )
+            self.assertEqual(fresh.returncode, 0, fresh.stderr)
+            self.assertIn("rime_ice", user_yaml.read_text(encoding="utf-8"))
+
+            user_yaml.write_text("var:\n  previously_selected_schema: double_pinyin\n", encoding="utf-8")
+            kept = self._lib_run(
+                env, script, NOCTALIA_MOD_ID="fcitx5", NOCTALIA_MOD_ROOT=str(PROJECT)
+            )
+            self.assertEqual(kept.returncode, 0, kept.stderr)
+            self.assertIn("double_pinyin", user_yaml.read_text(encoding="utf-8"))
+
+    def test_action_only_runs_actions_a_module_declares(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            not_system = self._run(env, fake_bin, "action", "niri", "whatever")
+            self.assertNotEqual(not_system.returncode, 0)
+            self.assertIn("not a system module", not_system.stderr)
+
+            unknown = self._run(env, fake_bin, "action", "fcitx5", "nonsense")
+            self.assertNotEqual(unknown.returncode, 0)
+            self.assertIn("has no action named nonsense", unknown.stderr)
+            self.assertIn("activate", unknown.stderr)
+
+            redundant = self._run(env, fake_bin, "action", "fcitx5", "install")
+            self.assertNotEqual(redundant.returncode, 0)
+            self.assertIn("top-level command", redundant.stderr)
+
+            missing = self._run(env, fake_bin, "action", "fcitx5", "activate")
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("not installed yet", missing.stderr)
+
+    def test_preset_and_part_refuse_system_modules(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            presets = self._run(env, fake_bin, "preset", "fcitx5", "list")
+            self.assertNotEqual(presets.returncode, 0)
+            self.assertIn("has no presets", presets.stderr)
+            parts = self._run(env, fake_bin, "part", "fcitx5", "glow", "list")
+            self.assertNotEqual(parts.returncode, 0)
+            self.assertIn("has no parts", parts.stderr)
+
+    def test_status_reports_a_system_module_through_its_own_action(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            table = self._run(env, fake_bin, "status")
+            self.assertIn("fcitx5\tabsent\t-\tsystem", table.stdout)
+
+            detail = self._run(env, fake_bin, "status", "fcitx5")
+            self.assertNotEqual(detail.returncode, 0)
+            self.assertIn("templates\tmissing", detail.stdout)
+
+            self._run(env, fake_bin, "install", "fcitx5", "--yes")
+            healthy = self._run(env, fake_bin, "status", "fcitx5")
+            self.assertEqual(healthy.returncode, 0, healthy.stderr)
+            self.assertIn("rime-ice\tconfigured", healthy.stdout)
+
+    def test_doctor_asks_a_system_module_for_its_status(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            self._run(env, fake_bin, "install", "fcitx5", "--yes")
+            report = self._run(env, fake_bin, "doctor")
+            self.assertIn("ok\tmodules\tfcitx5", report.stdout)
+
+    def test_a_failing_system_module_rolls_the_config_back(self) -> None:
+        """配置能退回快照；系统动作失败时至少不能让配置停在半新半旧。"""
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            with tempfile.TemporaryDirectory() as tmp:
+                tree = self._system_tree(tmp)
+                module = tree / "modules" / "probe"
+                (module / "actions").mkdir(parents=True)
+                (module / "module.conf").write_text(
+                    "MODULE_ID='probe'\nMODULE_KIND='system'\n", encoding="utf-8"
+                )
+                for name in ("install", "status", "uninstall"):
+                    path = module / "actions" / f"{name}.sh"
+                    path.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+
+                result = self._run(
+                    env,
+                    fake_bin,
+                    "install",
+                    "niri",
+                    "probe",
+                    "--yes",
+                    cli=tree / "bin" / "noctalia-mod",
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("install action failed", result.stderr)
+                self.assertFalse((env.home / ".config" / "niri").exists())
+                self.assertFalse(
+                    (env.home / ".local" / "state" / "noctalia-mod" / "modules" / "probe.state").exists()
+                )
+
+    def test_system_module_metadata_is_validated(self) -> None:
+        cases = {
+            "target on a system module": (
+                "MODULE_ID='probe'\nMODULE_KIND='system'\nMODULE_TARGET='probe'\n",
+                "must not declare a target",
+            ),
+            "unknown kind": (
+                "MODULE_ID='probe'\nMODULE_KIND='plugin'\nMODULE_TARGET='probe'\n",
+                "unknown module kind",
+            ),
+            "relative system path": (
+                "MODULE_ID='probe'\nMODULE_KIND='system'\nMODULE_SYSTEM_PATHS=('etc/x')\n",
+                "invalid absolute path",
+            ),
+            "escaping system path": (
+                "MODULE_ID='probe'\nMODULE_KIND='system'\nMODULE_SYSTEM_PATHS=('/etc/../root')\n",
+                "invalid absolute path",
+            ),
+            "target-only declaration": (
+                "MODULE_ID='probe'\nMODULE_KIND='system'\nMODULE_PRESERVE=('x')\n",
+                "meaningless in system module",
+            ),
+            "bad privilege flag": (
+                "MODULE_ID='probe'\nMODULE_KIND='system'\nMODULE_SYSTEM_PRIVILEGED='maybe'\n",
+                "invalid MODULE_SYSTEM_PRIVILEGED",
+            ),
+        }
+        for label, (conf, expected) in cases.items():
+            with self.subTest(label), TempEnv() as env:
+                root = env.home / "project"
+                actions = root / "modules" / "probe" / "actions"
+                actions.mkdir(parents=True)
+                (root / "modules" / "probe" / "module.conf").write_text(conf, encoding="utf-8")
+                for name in ("install", "status", "uninstall"):
+                    (actions / f"{name}.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+                script = (
+                    f"source {PROJECT / 'lib/common.sh'}; "
+                    f"source {PROJECT / 'lib/paths.sh'}; "
+                    f"source {PROJECT / 'lib/module-loader.sh'}; "
+                    "module_load probe"
+                )
+                result = self._lib_run(env, script, NOCTALIA_MOD_ROOT=str(root))
+                self.assertNotEqual(result.returncode, 0, label)
+                self.assertIn(expected, result.stderr, label)
+
+    def test_system_module_without_the_whole_triad_is_rejected(self) -> None:
+        with TempEnv() as env:
+            root = env.home / "project"
+            actions = root / "modules" / "probe" / "actions"
+            actions.mkdir(parents=True)
+            (root / "modules" / "probe" / "module.conf").write_text(
+                "MODULE_ID='probe'\nMODULE_KIND='system'\n", encoding="utf-8"
+            )
+            for name in ("install", "status"):
+                (actions / f"{name}.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+            script = (
+                f"source {PROJECT / 'lib/common.sh'}; "
+                f"source {PROJECT / 'lib/paths.sh'}; "
+                f"source {PROJECT / 'lib/module-loader.sh'}; "
+                "module_load probe"
+            )
+            result = self._lib_run(env, script, NOCTALIA_MOD_ROOT=str(root))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("no actions/uninstall.sh", result.stderr)
+
+    def test_trusted_executable_rejects_untrusted_paths(self) -> None:
+        """会被写进 root 读取的配置并被 root 执行的路径，不能出自用户可写的地方。"""
+        with TempEnv() as env:
+            candidate = env.home / "noctalia-greeter-session"
+            candidate.write_text("#!/bin/sh\nexit 0\n")
+            candidate.chmod(0o755)
+            head = f"source {PROJECT / 'lib/common.sh'}; source {PROJECT / 'lib/system.sh'}; "
+            untrusted = self._lib_run(env, head + f"system_trusted_executable {candidate}")
+            self.assertNotEqual(untrusted.returncode, 0)
+
+            unit = self._lib_run(env, head + f"source {PROJECT / 'lib/system.sh'}; system_trusted_executable '/usr/bin/env'")
+            # 沙箱里 /usr/bin 的属主可能被映射成别的 uid，那时这个肯定路径本来就不可信；
+            # 只在这台机器上真的满足前提时才断言"接受"。
+            if os.stat("/usr/bin").st_uid == 0 and os.stat("/usr/bin/env").st_uid == 0:
+                self.assertEqual(unit.returncode, 0, unit.stderr)
+                self.assertEqual(unit.stdout.strip(), "/usr/bin/env")
+
+            unsafe = self._lib_run(env, head + "system_trusted_executable '/usr/bin/env;rm -rf /'")
+            self.assertNotEqual(unsafe.returncode, 0)
+
+    def test_a_privileged_system_module_primes_sudo_before_acting(self) -> None:
+        with TempEnv() as env:
+            fake_bin, log = self._fake_commands(env)
+            planned = self._run(env, fake_bin, "plan", "greeter")
+            self.assertIn("privilege\tgreeter\tsudo", planned.stdout)
+            self.assertIn("service\tgreeter\tgreetd", planned.stdout)
+
+            result = self._run(env, fake_bin, "install", "greeter", "--yes")
+            self.assertNotEqual(result.returncode, 0)
+            # 权限在动作之前统一取：不能让动作跑到一半才弹 sudo。
+            self.assertIn("sudo <-v>", log.read_text(encoding="utf-8"))
+            self.assertIn("trusted executable", result.stderr)
+
+    def test_greeter_takes_over_and_gives_back_the_login_manager(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            self._greeter_shims(fake_bin)
+            with tempfile.TemporaryDirectory() as tmp:
+                tree = self._system_tree(tmp)
+                root = Path(tmp) / "system"
+                root.mkdir()
+                self._redirect_greeter_paths(tree, root)
+                self._stub_trusted_executable(tree)
+                cli = tree / "bin" / "noctalia-mod"
+                units = env.home / "systemd.units"
+                units.write_text("sddm\n", encoding="utf-8")
+                extra = {"FAKE_SYSTEMD_STATE": str(units)}
+                config = root / "etc" / "greetd" / "config.toml"
+                record = root / "etc" / "greetd" / "noctalia-mod-display-manager"
+
+                installed = self._run(
+                    env, fake_bin, "install", "greeter", "--yes", cli=cli, extra_env=extra
+                )
+                self.assertEqual(installed.returncode, 0, installed.stderr)
+                text = config.read_text(encoding="utf-8")
+                self.assertIn("noctalia-greeter-session", text)
+                self.assertIn("-- --session niri", text)
+                self.assertIn('user = "greeter"', text)
+                self.assertTrue(
+                    (root / "etc" / "polkit-1" / "rules.d" / "50-noctalia-greeter.rules").is_file()
+                )
+                self.assertTrue((root / "var" / "lib" / "noctalia-greeter").is_dir())
+                self.assertEqual(record.read_text(encoding="utf-8"), "sddm\n")
+                self.assertEqual(units.read_text(encoding="utf-8").split(), ["greetd"])
+
+                # 重装：greetd 已经 enable，不再动显示管理器，记录文件原样留着。
+                again = self._run(
+                    env, fake_bin, "install", "greeter", "--yes", cli=cli, extra_env=extra
+                )
+                self.assertEqual(again.returncode, 0, again.stderr)
+                self.assertEqual(record.read_text(encoding="utf-8"), "sddm\n")
+
+                removed = self._run(
+                    env, fake_bin, "uninstall", "greeter", "--yes", cli=cli, extra_env=extra
+                )
+                self.assertEqual(removed.returncode, 0, removed.stderr)
+                self.assertEqual(units.read_text(encoding="utf-8").split(), ["sddm"])
+                self.assertFalse(config.exists())
+                self.assertFalse((root / "var" / "lib" / "noctalia-greeter").exists())
+                self.assertFalse(record.exists())
+
+    def test_greeter_puts_the_login_manager_back_when_enabling_greetd_fails(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            self._greeter_shims(fake_bin)
+            with tempfile.TemporaryDirectory() as tmp:
+                tree = self._system_tree(tmp)
+                root = Path(tmp) / "system"
+                root.mkdir()
+                self._redirect_greeter_paths(tree, root)
+                self._stub_trusted_executable(tree)
+                units = env.home / "systemd.units"
+                units.write_text("sddm\n", encoding="utf-8")
+                extra = {
+                    "FAKE_SYSTEMD_STATE": str(units),
+                    "FAKE_SYSTEMCTL_FAIL": "enable:greetd",
+                }
+                result = self._run(
+                    env,
+                    fake_bin,
+                    "install",
+                    "greeter",
+                    "--yes",
+                    cli=tree / "bin" / "noctalia-mod",
+                    extra_env=extra,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(units.read_text(encoding="utf-8").split(), ["sddm"])
+                self.assertFalse((root / "etc" / "greetd" / "config.toml").exists())
+                self.assertFalse(
+                    (
+                        env.home / ".local" / "state" / "noctalia-mod" / "modules" / "greeter.state"
+                    ).exists()
+                )
+
+    def test_greeter_refuses_a_record_that_names_an_unknown_manager(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            self._greeter_shims(fake_bin)
+            with tempfile.TemporaryDirectory() as tmp:
+                tree = self._system_tree(tmp)
+                root = Path(tmp) / "system"
+                (root / "etc" / "greetd").mkdir(parents=True)
+                self._redirect_greeter_paths(tree, root)
+                self._stub_trusted_executable(tree)
+                record = root / "etc" / "greetd" / "noctalia-mod-display-manager"
+                # 记录文件是可以被 root 之外的进程读到的；内容不认识就不能拿它去 enable。
+                record.write_text("evil.service\n", encoding="utf-8")
+                units = env.home / "systemd.units"
+                units.write_text("greetd\n", encoding="utf-8")
+                result = self._run(
+                    env,
+                    fake_bin,
+                    "uninstall",
+                    "greeter",
+                    "--yes",
+                    cli=tree / "bin" / "noctalia-mod",
+                    extra_env={"FAKE_SYSTEMD_STATE": str(units)},
+                )
+                # 账本里没有 greeter（没装过），所以卸载根本不会跑动作。
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(units.read_text(encoding="utf-8").split(), ["greetd"])
+
+    def test_fisher_refuses_a_lockfile_it_did_not_pin(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            self._run(env, fake_bin, "install", "fish", "--yes")
+            lock = env.home / ".config" / "fish" / "fish_plugins"
+            lock.write_text("someone/else@deadbeef\n", encoding="utf-8")
+            result = self._run(env, fake_bin, "install", "fisher", "--yes")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("is not the plugin list this module pins", result.stderr)
+            self.assertFalse((env.home / ".config" / "fish" / "functions").exists())
+
+    def test_fisher_refuses_to_take_over_a_foreign_installation(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            self._run(env, fake_bin, "install", "fish", "--yes")
+            functions = env.home / ".config" / "fish" / "functions"
+            functions.mkdir()
+            (functions / "fisher.fish").write_text("someone else's\n", encoding="utf-8")
+            result = self._run(env, fake_bin, "install", "fisher", "--yes")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("without a noctalia-mod ownership record", result.stderr)
+            self.assertEqual((functions / "fisher.fish").read_text(encoding="utf-8"), "someone else's\n")
+
+    def _fisher_tree(self, tmp: str, fake_bin: Path) -> tuple[Path, str]:
+        """A project copy whose fisher module pins the sandbox bootstrap instead."""
+        bootstrap = "#!/usr/bin/env fish\n# sandbox bootstrap\n"
+        payload = Path(tmp) / "bootstrap.fish"
+        payload.write_text(bootstrap, encoding="utf-8")
+        digest = hashlib.sha256(bootstrap.encode()).hexdigest()
+        (fake_bin / "curl").write_text(
+            "#!/usr/bin/env bash\n"
+            "dest=''\n"
+            "while (($#)); do\n"
+            "    [[ $1 == -o ]] && { shift; dest=$1; }\n"
+            "    shift\n"
+            "done\n"
+            f'cp -- {payload} "$dest"\n'
+        )
+        (fake_bin / "curl").chmod(0o755)
+        (fake_bin / "fish").write_text(
+            "#!/usr/bin/env bash\n"
+            "while (($#)); do [[ $1 == -- ]] && { shift; break; }; shift; done\n"
+            "dir=$2\n"
+            'mkdir -p "$dir/functions" "$dir/completions" "$dir/conf.d"\n'
+            'printf "fisher\\n" > "$dir/functions/fisher.fish"\n'
+            'printf "fisher\\n" > "$dir/completions/fisher.fish"\n'
+            'printf "autopair\\n" > "$dir/conf.d/autopair.fish"\n'
+            '[[ ${FAKE_FISH_MODE:-full} == partial ]] && exit 1\n'
+            'printf "fzf\\n" > "$dir/conf.d/fzf.fish"\n'
+            'printf "fzf\\n" > "$dir/completions/fzf_configure_bindings.fish"\n'
+            "exit 0\n"
+        )
+        (fake_bin / "fish").chmod(0o755)
+        tree = self._system_tree(tmp)
+        conf = tree / "modules" / "fisher" / "module.conf"
+        conf.write_text(
+            conf.read_text(encoding="utf-8").replace(
+                "0fb6c81ae3003e95b5671766fa6c25c3597066e29965b7772f6c1b007387356d", digest
+            ),
+            encoding="utf-8",
+        )
+        return tree, digest
+
+    def test_fisher_records_ownership_and_a_partial_run_stays_retryable(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            with tempfile.TemporaryDirectory() as tmp:
+                tree, _ = self._fisher_tree(tmp, fake_bin)
+                cli = tree / "bin" / "noctalia-mod"
+                lockfile = self._run(env, fake_bin, "install", "fish", "--yes", cli=cli)
+                self.assertEqual(lockfile.returncode, 0, lockfile.stderr)
+                record = env.home / ".local" / "state" / "noctalia-mod" / "fisher.owned"
+                functions = env.home / ".config" / "fish" / "functions"
+
+                partial = self._run(
+                    env,
+                    fake_bin,
+                    "install",
+                    "fisher",
+                    "--yes",
+                    cli=cli,
+                    extra_env={"FAKE_FISH_MODE": "partial"},
+                )
+                self.assertNotEqual(partial.returncode, 0)
+                # 失败时已经落盘的文件同样归我们：不记账，重试就会留下垃圾。
+                self.assertIn("complete\t0", record.read_text(encoding="utf-8"))
+                self.assertIn("functions/fisher.fish", record.read_text(encoding="utf-8"))
+
+                retried = self._run(env, fake_bin, "install", "fisher", "--yes", cli=cli)
+                self.assertEqual(retried.returncode, 0, retried.stderr)
+                self.assertIn("complete\t1", record.read_text(encoding="utf-8"))
+
+                mine = functions / "mine.fish"
+                mine.write_text("mine\n", encoding="utf-8")
+                removed = self._run(env, fake_bin, "uninstall", "fisher", "--yes", cli=cli)
+                self.assertEqual(removed.returncode, 0, removed.stderr)
+                self.assertFalse(record.exists())
+                self.assertTrue(mine.is_file(), "only owned files may be removed")
+                self.assertFalse((functions / "fisher.fish").exists())
+
+    def test_network_fetch_verifies_and_times_out_explicitly(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            log = env.home / "curl.log"
+            (fake_bin / "curl").write_text(
+                "#!/usr/bin/env bash\n"
+                'printf "%s\\n" "$*" >> "$CURL_LOG"\n'
+                "dest=''\n"
+                "while (($#)); do\n"
+                "    [[ $1 == -o ]] && { shift; dest=$1; }\n"
+                "    shift\n"
+                "done\n"
+                "printf 'payload\\n' > \"$dest\"\n"
+                "exit 0\n"
+            )
+            (fake_bin / "curl").chmod(0o755)
+            head = (
+                f"source {PROJECT / 'lib/common.sh'}; "
+                f"source {PROJECT / 'lib/network.sh'}; "
+            )
+            destination = env.home / "out"
+            wrong = self._lib_run(
+                env,
+                head + f"net_fetch_verified {destination} {'0' * 64} https://example.invalid/x",
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                CURL_LOG=str(log),
+            )
+            self.assertNotEqual(wrong.returncode, 0)
+            self.assertIn("checksum mismatch", wrong.stderr)
+            self.assertFalse(destination.exists(), "a file that failed verification must not be left behind")
+            # 没有超时的网络调用会把一条命令永远挂住：形状必须是契约的一部分。
+            invocation = log.read_text(encoding="utf-8")
+            self.assertIn("--connect-timeout", invocation)
+            self.assertIn("--max-time", invocation)
+
+            digest = hashlib.sha256(b"payload\n").hexdigest()
+            right = self._lib_run(
+                env,
+                head + f"net_fetch_verified {destination} {digest} https://example.invalid/x",
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                CURL_LOG=str(log),
+            )
+            self.assertEqual(right.returncode, 0, right.stderr)
+            self.assertEqual(destination.read_text(encoding="utf-8"), "payload\n")
 
 
 if __name__ == "__main__":

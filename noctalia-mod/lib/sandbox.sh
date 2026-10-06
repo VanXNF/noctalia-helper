@@ -82,6 +82,8 @@ sandbox_verify_targets() {
             failed=1
             continue
         fi
+        # 系统级模块不往配置根里铺东西，没有可校验的目标树（PLAN §11 阶段 F）。
+        module_is_system && continue
         target="$config/$MODULE_TARGET"
         if [[ ! -e $target && ! -L $target ]]; then
             error "sandbox: $id did not deploy $target"

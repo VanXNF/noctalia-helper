@@ -235,6 +235,10 @@ module_deploy() {
     local mode reset_preset=no
     local -a preserve_paths=()
     module_load "$id" || return 1
+    module_is_system && {
+        error "module $id is a system module; its actions are not a deployment tree"
+        return 1
+    }
     root=$(module_root "$id")
     target=$(safe_target_path "$MODULE_TARGET") || return 1
     if [[ -n $part_slot ]]; then
@@ -285,6 +289,7 @@ module_deploy() {
 module_clear_managed_config() {
     local id=$1 root target parent base staged
     module_load "$id" || return 1
+    module_is_system && return 0
     root=$(module_root "$id")
     target=$(safe_target_path "$MODULE_TARGET") || return 1
     [[ -e $target || -L $target ]] || return 0

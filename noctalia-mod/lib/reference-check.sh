@@ -70,6 +70,9 @@ reference_deployed_paths() {
     local id root target rel part variable path
     while IFS= read -r id; do
         module_load "$id" || continue
+        # 系统级模块不往配置根里部署任何东西，也就没有可供别人引用的部署集合
+        # （PLAN §11 阶段 F）。
+        module_is_system && continue
         root=$(module_root "$id")
         target=$MODULE_TARGET
         if [[ -f $root/$MODULE_FILES/$target || -L $root/$MODULE_FILES/$target ]]; then

@@ -24,13 +24,20 @@ noctalia-mod/bin/noctalia-mod setup --with fcitx5    # add a declared optional p
 
 Optional programs — `fcitx5`, `ddcutil`, `mpvpaper` and friends — show up as
 `optional` lines only when this machine lacks them, and only the ones you name
-with `--with` get installed. A run ends with a short summary of what was
-installed, where the configuration landed, and how to undo it. Re-running
-converges: nothing is duplicated and no staging directory is left behind.
+with `--with` get installed. That installs the *program*: `--with fcitx5` gets
+you the input method `niri` spawns at startup. The skin, the Rime schema and
+"make it the default theme" are a module of its own — `noctalia-mod install
+fcitx5` — because that part does real work rather than dropping a package in.
+A run ends with a short summary of what was installed, where the configuration
+landed, and how to undo it. Re-running converges: nothing is duplicated and no
+staging directory is left behind.
 
 The two stages are also usable on their own, and neither needs the other to have
 run first. `deps` only touches packages; `install` only touches `~/.config`.
-Unlike `setup`, an argument-less `install` means every module:
+Unlike `setup`, an argument-less `install` means every module — every
+*configuration* module, that is. System modules (`fcitx5`, `fisher`, `greeter`)
+write `/etc`, toggle systemd units and switch display managers, so they are never
+implied: name them.
 
 ```bash
 # 1. packages
@@ -39,7 +46,7 @@ noctalia-mod/bin/noctalia-mod deps niri noctalia --yes
 
 # 2. configuration
 noctalia-mod/bin/noctalia-mod install niri noctalia   # pre-flight, then confirm
-noctalia-mod/bin/noctalia-mod install --yes           # every module, no prompts
+noctalia-mod/bin/noctalia-mod install --yes           # every configuration module
 ```
 
 `deps` verifies an AUR helper exists and primes `sudo` before installing
@@ -55,11 +62,12 @@ noctalia-mod/bin/noctalia-mod plan niri noctalia
 noctalia-mod/bin/noctalia-mod preset kitty list
 noctalia-mod/bin/noctalia-mod preset kitty apply transparent --yes
 noctalia-mod/bin/noctalia-mod part niri glow apply glow --yes
+noctalia-mod/bin/noctalia-mod action fcitx5 activate
 noctalia-mod/bin/noctalia-mod theme sync
 noctalia-mod/bin/noctalia-mod wallpapers deploy
 noctalia-mod/bin/noctalia-mod snapshot "before edit"
 noctalia-mod/bin/noctalia-mod rollback
-noctalia-mod/bin/noctalia-mod status
+noctalia-mod/bin/noctalia-mod status fcitx5
 noctalia-mod/bin/noctalia-mod uninstall niri --yes
 noctalia-mod/bin/noctalia-mod doctor
 noctalia-mod/bin/noctalia-mod bug
@@ -68,10 +76,31 @@ noctalia-mod/bin/noctalia-mod test
 noctalia-mod/bin/noctalia-mod update
 ```
 
-Eight modules are wired up: `niri`, `noctalia`, `kitty`, `fish`, `starship`,
-`fastfetch`, `xdg-desktop-portal`, and `zed`. Module metadata lives in
-`modules/<id>/module.conf`; default files, presets, and parts stay inside that
-module directory.
+Eleven modules are wired up. Eight of them are configuration trees: `niri`,
+`noctalia`, `kitty`, `fish`, `starship`, `fastfetch`, `xdg-desktop-portal`, `zed`.
+Module metadata lives in `modules/<id>/module.conf`; default files, presets, and
+parts stay inside that module directory.
+
+Three are **system modules**: they ship `actions/*.sh` instead of a target tree,
+because what they do is not "swap a directory" — `fcitx5` deploys the NyxMellow
+skin into `~/.local/share/fcitx5` and sets up Rime Ice, `fisher` installs pinned
+fish plugins, `greeter` writes `/etc/greetd` and takes over the login screen.
+
+```bash
+noctalia-mod/bin/noctalia-mod install fcitx5      # assets + Rime Ice + set as default
+noctalia-mod/bin/noctalia-mod action fcitx5 deploy   # assets only, theme untouched
+noctalia-mod/bin/noctalia-mod install fisher
+noctalia-mod/bin/noctalia-mod install greeter     # needs root; writes /etc
+noctalia-mod/bin/noctalia-mod status greeter
+```
+
+An `install` of a system module lists every path it will touch, every unit it
+will enable, and whether it needs root, before asking once. `install` and
+`uninstall` work the same way as for configuration modules; `status <module>`
+runs the module's own read-only probe and follows its exit code. Actions beyond
+the triad (`deploy`, `activate`, `rime`) have to be declared by the module and
+are run with `action <module> <name>` — the command line cannot invent one, the
+same way `--with` only accepts declared optional programs.
 
 ## Presets
 
@@ -105,13 +134,19 @@ nothing left to lose.
 
 ## What a deploy also does
 
-Two things Noctalia does not do for us, run at the end of `install` and `setup`:
+Three things Noctalia does not do for us, run at the end of `install` and `setup`:
 
 - **`theme sync`** writes `gtk-{3,4}.0/settings.ini` (`gtk-application-prefer-dark-theme`,
   `gtk-theme-name`) and sets `gsettings … gtk-theme`, following the current mode. Noctalia
   keeps `color-scheme` in step but never touches either of those — and Brave/Chromium read
   `settings.ini` at cold start. It warns instead of failing the deploy if `gsettings` or a
   session bus is unavailable.
+- **GTK render cleanup**: a legacy `gtk-{3,4}.0/gtk-dark.css` symlink importing
+  `libadwaita.css` would override the Material You colors, so symlinks by that name are
+  removed, and Noctalia is asked to render its templates (`msg config-reload` +
+  `msg templates-apply`) so the new configuration takes effect now rather than at the next
+  wallpaper change. This is what the old engine's `gtktheme` module did; there was nothing
+  left for it to be a module *of*, since the template registration ships with `noctalia`.
 - **Wallpapers** (`wallpapers deploy|status|remove`): the offline pack travels with the
   project in `assets/wallpapers/` and is copied into `<XDG Pictures>/Wallpapers`
   no-clobber — an existing file wins. Everything this project places is recorded in
@@ -172,12 +207,18 @@ process would deploy the old code.
 ## Drift and runtime writers
 
 A file the runtime rewrites but this project still owns — Noctalia rewrites `kitty.conf`,
-`kitty/themes/noctalia.conf` and `starship.toml` in place — is declared in
-`MODULE_RUNTIME_WRITES`: it is still overwritten on every deploy, but it does not count as
-drift. That is deliberately separate from `MODULE_PRESERVE`, which means "do not
-overwrite": using preserve here would stop the module from ever updating its own file.
-The cost is that those files give up drift detection, which is the point — reporting drift
-for a file the runtime always rewrites only teaches people to ignore drift.
+`kitty/themes/noctalia.conf` and `starship.toml` in place, `fisher` rewrites
+`fish/fish_plugins` — is declared in `MODULE_RUNTIME_WRITES`: it is still overwritten on
+every deploy, but it does not count as drift. That is deliberately separate from
+`MODULE_PRESERVE`, which means "do not overwrite": using preserve here would stop the
+module from ever updating its own file. The cost is that those files give up drift
+detection, which is the point — reporting drift for a file the runtime always rewrites
+only teaches people to ignore drift.
+
+Preserve matters for another reason too: a configuration module's target is swapped as a
+whole tree, so anything the module does not ship but that has to survive — `fish`'s
+`functions/` directory, the four plugin files `fisher` drops into `conf.d` and
+`completions` — has to be declared there by name.
 
 ## Reference check
 
@@ -232,9 +273,11 @@ which is what a future cleanup would need.
 
 ## Tests
 
-The suite is plain `unittest` and runs in a temporary `HOME` with fake
-`pacman`, `sudo`, `niri`, `noctalia`, and `pkill` on `PATH`. It never touches the
-real `~/.config`.
+The suite is plain `unittest` and runs in a temporary `HOME` with fake `pacman`,
+`sudo`, `systemctl`, `niri`, `noctalia`, `pkill` and `paru` on `PATH`. It never
+touches the real `~/.config`, `/etc` or systemd: the tests that need those run
+against a byte-identical copy of the project whose greeter paths point into the
+sandbox.
 
 ```bash
 python3 -m unittest discover -s noctalia-mod/tests -q

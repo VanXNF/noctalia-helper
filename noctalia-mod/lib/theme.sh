@@ -121,3 +121,33 @@ theme_status() {
     printf 'gtk-theme\t%s\n' "$current_gtk"
     printf 'expected-gtk-theme\t%s\n' "$(theme_gtk_name "$mode")"
 }
+
+# ── GTK 渲染一侧的收尾（PLAN §11 阶段 F 的 gtktheme）──────────────────────────
+#
+# 旧引擎里 `gtktheme` 是个独立模块，实际只做三件事：注册模板、催 Noctalia 渲染、
+# 清掉旧版留下的 gtk-dark.css 软链。注册本来就随 noctalia 模块的配置发布（gtk3/gtk4
+# 两节），剩下两件是引擎级的 GTK 步骤，和写 settings.ini 属同一类，所以收在这里，
+# 不为两个命令再建一个模块——那正是这个项目已经砍掉两次的"空转概念"（PLAN §11 阶段 D）。
+
+# 旧版留下的 gtk-dark.css 软链 import 了 libadwaita.css，会盖掉 Material You 颜色。
+# 只删软链：用户自己写的同名文件不是我们的东西。
+theme_clean_legacy_overrides() {
+    local version css
+    for version in gtk-3.0 gtk-4.0; do
+        css="$(config_root)/$version/gtk-dark.css"
+        [[ -L $css ]] || continue
+        rm -f -- "$css" || return 1
+        printf 'gtk-dark.css\tremoved\t%s\n' "$css"
+    done
+    return 0
+}
+
+# 催 Noctalia 按当前壁纸渲染全部模板。催不动只警告：下一次主题或壁纸变化它还会渲染，
+# 而配置本身已经铺好了，不该为此把一次成功的部署弄成失败。
+theme_trigger_render() {
+    command -v noctalia >/dev/null 2>&1 || return 0
+    timeout 15 noctalia msg config-reload >/dev/null 2>&1 || true
+    timeout 30 noctalia msg templates-apply >/dev/null 2>&1 ||
+        warn 'Noctalia did not render the templates; it will on the next theme change'
+    return 0
+}

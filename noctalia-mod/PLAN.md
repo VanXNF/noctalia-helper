@@ -40,8 +40,14 @@ noctalia-mod setup --with fcitx5       # 顺带装一个模块声明过的可选
 noctalia-mod deps                      # 只装依赖，不碰 ~/.config
 noctalia-mod deps niri noctalia --yes  # 同上，非交互
 noctalia-mod install niri noctalia     # 只铺配置
-noctalia-mod install --yes             # 全量，非交互
+noctalia-mod install --yes             # 全部配置模块，非交互
+noctalia-mod install fcitx5            # 系统级模块：写 ~/.local/share、配输入法
+noctalia-mod install greeter           # 系统级模块 + 需要 root：接管登录界面
+noctalia-mod action fcitx5 activate    # 只把皮肤设为当前主题
 ```
+
+**系统级模块永远要点名**（§3）：不带参数的 `plan`/`deps`/`install` 只覆盖配置模块，
+`setup` 无参数仍是核心集。
 
 设计要求：
 
@@ -152,6 +158,8 @@ noctalia-mod/
 │   ├── state.sh           # 状态账本
 │   ├── snapshot.sh        # 快照、回滚、清理
 │   ├── deploy.sh          # 暂存构建、原子替换、保留规则
+│   ├── system.sh          # 系统级模块的动作契约与 root/systemd 原语
+│   ├── network.sh         # 受校验的下载（多镜像 + sha256）
 │   ├── preset.sh          # 用户预设的存取与预设消失语义
 │   ├── theme.sh           # GTK 深浅同步（Noctalia 不做的那一半）
 │   ├── wallpaper.sh       # 壁纸部署与 managed 账本
@@ -164,7 +172,8 @@ noctalia-mod/
 ├── modules/
 │   └── <module>/          # 见 §3
 ├── assets/
-│   └── wallpapers/        # 离线壁纸（随子项目走，便于整目录独立取走）
+│   ├── wallpapers/        # 离线壁纸（随子项目走，便于整目录独立取走）
+│   └── fcitx5/            # NyxMellow 输入法皮肤素材
 ├── tests/                 # 子项目自带测试（自包含）
 ├── PLAN.md                # 本文档：方案与进度
 └── README.md              # 使用说明
@@ -178,6 +187,19 @@ modules/<module>/
 ├── files/                 # 默认配置源
 ├── presets/               # 官方预设，可为空
 ├── parts/                 # 可插拔零件，可为空
+└── README.md
+```
+
+系统级模块（`MODULE_KIND='system'`，见 §3）把 `files/`/`presets/`/`parts/` 换成动作脚本：
+
+```text
+modules/<module>/
+├── module.conf            # 同样的元数据，另加 MODULE_KIND 与动作声明
+├── actions/
+│   ├── install.sh         # 装
+│   ├── status.sh          # 查（只读，健康退 0）
+│   ├── uninstall.sh       # 卸
+│   └── <extra>.sh         # MODULE_SYSTEM_EXTRA_ACTIONS 声明的额外动作
 └── README.md
 ```
 
@@ -196,7 +218,8 @@ modules/<module>/
 | 变量 | 含义 |
 |---|---|
 | `MODULE_ID` | 模块 ID，必须与目录名一致 |
-| `MODULE_TARGET` | 相对 `$XDG_CONFIG_HOME` 的目标路径（文件或目录） |
+| `MODULE_KIND` | `config`（默认，一棵目标树）或 `system`（自带动作脚本），见下 |
+| `MODULE_TARGET` | 相对 `$XDG_CONFIG_HOME` 的目标路径（文件或目录）；`system` 模块必须留空 |
 | `MODULE_FILES` | 默认配置源目录，默认 `files` |
 | `MODULE_REPO_PACKAGES` | 官方仓库依赖 |
 | `MODULE_AUR_PACKAGES` | AUR 依赖 |
@@ -204,12 +227,21 @@ modules/<module>/
 | `MODULE_RUNTIME_WRITES` | 运行时也会改写、但模块仍然拥有并覆盖的路径（只影响指纹，不影响覆盖），见 §1 |
 | `MODULE_CHMOD` | 需要加执行位的相对 glob |
 | `MODULE_RELOAD_COMMAND` | 部署后的 reload/reload 动作（argv 数组） |
-| `MODULE_VALIDATE_PATHS` | 部署后必须存在的路径 |
+| `MODULE_VALIDATE_PATHS` | 部署后必须存在的路径；`system` 模块里写绝对路径 |
 | `MODULE_EXTERNAL_REFS` | 被引用但不由本项目提供的配置路径（运行时产出或外部提供），见下 |
 | `MODULE_REQUIRED_COMMANDS` | 必需程序，写作 `命令:提供它的包`，见下 |
 | `MODULE_OPTIONAL_COMMANDS` | 可选程序，写作 `命令` 或 `命令:包`；缺失只提示，`setup --with` 只认这里声明过的名字 |
 | `MODULE_EXTERNAL_COMMANDS` | 基础系统自带的程序，声明出来给 spawn 检查一个落点 |
 | `MODULE_PARTS` / `MODULE_PART_<SLOT>_TARGET` / `MODULE_PART_<SLOT>_DEFAULT` | 零件插槽声明 |
+
+`system` 模块专属：
+
+| 变量 | 含义 |
+|---|---|
+| `MODULE_SYSTEM_EXTRA_ACTIONS` | 三件套之外的额外动作名（如 fcitx5 的 `deploy`/`activate`/`rime`） |
+| `MODULE_SYSTEM_PATHS` | 动作会碰的绝对路径，预检清单里逐条列出来 |
+| `MODULE_SYSTEM_SERVICES` | 会 enable 的 systemd 单元，预检里列出来 |
+| `MODULE_SYSTEM_PRIVILEGED` | `yes` 表示动作需要 root，引擎在动手前统一取一次权限 |
 
 默认行为由目录约定驱动，`module.conf` 只声明例外。
 
@@ -222,6 +254,54 @@ modules/<module>/
 - **引用自洽（`已完成`，见 §10 已修复 P0-2）**：被部署配置引用到的
   `~/.config` 路径，必须在部署后真实存在——要么由某个已接入模块提供，要么在
   `MODULE_EXTERNAL_REFS` 里显式登记。没有第三条路。
+
+### 系统级模块（`MODULE_KIND='system'`）
+
+配置模块的模型是"一棵树换一棵树"：目标在配置根内、先暂存再原子替换、失败整棵回滚。
+有一类事情没有这个形状——写 `/etc`、enable systemd 单元、用 fish 装插件、把素材放进
+`~/.local/share`。硬塞进"目标目录"只会得到一个假装原子的东西，所以它们换一套契约：
+**模块自带动作脚本，引擎负责预检、调用、记账。**
+
+```text
+modules/<id>/actions/install.sh    装：把这件事做完
+modules/<id>/actions/status.sh     查：只读探测，健康退 0、不健康非 0
+modules/<id>/actions/uninstall.sh  卸：还原
+modules/<id>/actions/<extra>.sh    MODULE_SYSTEM_EXTRA_ACTIONS 声明的额外动作
+```
+
+- **动作是独立进程**：引擎用 `bash <脚本>` 调它，通过环境传 `NOCTALIA_MOD_ROOT`、
+  `NOCTALIA_MOD_ID`、`NOCTALIA_MOD_ACTION`；脚本自己 source `lib/*.sh`，用的是同一套
+  原语。引擎不替它做原子替换，也**不替它回滚**——系统级动作没有"换回去"这一说，
+  备份与还原是动作自己的责任（旧引擎也是这么分的）。
+- **包由引擎装**：`MODULE_REPO_PACKAGES` / `MODULE_AUR_PACKAGES` 照旧声明，`deps` /
+  `install` / `setup` 走同一条安装通道；动作只做系统配置，缺了包就报错退出。这样
+  "装包一次授权"仍然成立。
+- **权限一次取**：`MODULE_SYSTEM_PRIVILEGED='yes'` 的模块，引擎在动手前统一 `sudo -v`，
+  预检里打一行 `privilege <模块> sudo`。动作中途再弹提示是不允许的。
+- **预检是声明出来的，不是从脚本里猜的**：`MODULE_SYSTEM_PATHS` 与
+  `MODULE_SYSTEM_SERVICES` 决定用户看到的那一次确认值。已知取舍：这两项是文档性的
+  （引擎不核对脚本实际写了什么），`MODULE_VALIDATE_PATHS`（绝对路径）才是硬校验。
+- **永远不被隐式选中**：不带参数的 `plan` / `deps` / `install` 只覆盖配置模块。
+  系统级模块必须点名——写 `/etc`、切换显示管理器的事不该由"我什么都没写"触发。
+- **账本只记四件事**：`kind=system`、`enabled`、`source_version`、`last_result`。
+  没有目标树，所以没有 `target` / `preset` / `fingerprint` / `part.*`；快照里也不会
+  出现系统模块（`snapshot_create` 直接跳过它）。
+- **额外动作要点名**：`noctalia-mod action <模块> <动作>`，动作必须在
+  `MODULE_SYSTEM_EXTRA_ACTIONS` 里声明过、模块必须已装（`status` 除外）。
+  这条和 `--with` 只认声明过的可选程序是同一条规矩：命令行不能凭空指定动作。
+- **不带配置根内的目标树**，因此 `MODULE_PRESERVE` / `MODULE_RUNTIME_WRITES` /
+  `MODULE_CHMOD` / `MODULE_EXTERNAL_REFS` / `MODULE_PARTS` 在系统级模块里一律非法——
+  留着只会让人以为它们生效了。
+
+**它替代了旧引擎的 `post_install = "模块:函数"`**。旧引擎在 `.optional-apps.toml` 里写
+`post_install = "fcitx:setup_rime_ice"`，装完 `fcitx5-rime` 再反射调用一个函数；新项目
+没有这条缝，也不需要：**声明那个包的模块自己就是那个钩子**——`MODULE_AUR_PACKAGES` 里的
+`rime-ice-git` 属于 fcitx5 模块，`install fcitx5` 自然就把方案配好了。
+
+**跨模块写别人配置文件是不允许的**。旧引擎的 `fcitx_register_templates()` 会往 noctalia
+的配置里追加模板节；新项目把那份注册放回 noctalia 模块自己的配置，并给它加
+`requires_path`——Noctalia 在路径不存在时跳过这条模板，于是它天生是惰性的：
+没装皮肤不报错，卸了皮肤也不会留下指向空路径的注册。
 
 ### 引用自洽校验
 
@@ -284,8 +364,9 @@ modules/<module>/
 **没有 `hooks.sh`**（阶段 D 复评后关闭）：模块侧的收尾动作由
 `MODULE_RELOAD_COMMAND` 承担，运行时写入的文件由 `MODULE_PRESERVE` 声明，引擎级的全局
 步骤（路径改写、GTK 深浅同步）属于引擎自己。旧引擎里唯一像"模块钩子"的东西是
-`.module.toml` 的 `post_install = "模块:函数"`（fcitx5-rime 在用），那是阶段 F 的事，
-届时单独设计，不复活这个已经空转了两轮的概念。
+`.module.toml` 的 `post_install = "模块:函数"`（fcitx5-rime 在用）——阶段 F 的答案是
+"不需要这条缝"：系统级模块的三件套加上"谁声明包谁负责配好"已经覆盖了它，见上面
+「系统级模块」。
 
 ## 4. 配置层次与保留规则
 
@@ -412,6 +493,12 @@ Material You 色板的输出位置（见 noctalia 模块配置），子项目只
 软件包装掉——就是 §7 那个依赖阶段本身。所以 `install` 单独跑也是完整的，不强制
 先跑 `deps`；反过来 `deps` 单独跑也从不碰配置。
 
+**系统级模块在这条线上的位置**：确认之后先取权限（需要 root 的话），然后装包，再
+**先配置后系统动作**——配置能整棵退回快照，系统动作退不了，所以配置放前面，系统动作
+失败时至少配置不会停在半新半旧。系统动作自己的备份与回滚由动作负责（§3）。一次
+`install` 里没有任何配置模块时（例如只装 `fcitx5`），不创建快照：空快照只会给
+`snapshot list` 添噪音。
+
 **环境检查语义（明确）**：第一阶段只提示，不阻断。目标环境之外的机器上装出来
 的东西大概率不能用，但那是用户的选择；`plan` 会把缺失项列出来。若将来要阻断，
 必须同时提供 `--force` 出口。
@@ -436,6 +523,10 @@ Material You 色板的输出位置（见 noctalia 模块配置），子项目只
 | `last_result` | 最近一次部署结果 | 部分（只写成功） |
 | `part.<slot>` | 各插槽当前零件 | 已完成 |
 | `fingerprint` | 管理内容的摘要，用于漂移检测 | 已完成 |
+
+系统级模块只写其中四个（`kind=system`、`enabled`、`source_version`、`last_result`）：
+没有目标树，就没有 `target`／`preset`／`last_snapshot`／`custom_paths`／
+`preserve_paths`／`fingerprint`／`part.*` 可写（见 §3）。
 
 另一份**项目级**账本 `$XDG_STATE_HOME/noctalia-mod/packages.tsv`：
 
@@ -541,7 +632,10 @@ aur-helper	paru
 
 ## 8. 已接入模块
 
-`已完成`：niri、noctalia、kitty、fish、starship、fastfetch、xdg-desktop-portal、zed。
+`已完成`（配置模块八个）：niri、noctalia、kitty、fish、starship、fastfetch、
+xdg-desktop-portal、zed。
+
+`已完成`（系统级模块三个，§3）：fcitx5、fisher、greeter。
 
 - **niri**：默认配置、`monitor.kdl` / `effects.kdl` / `colors.kdl` 等 preserve、
   `effects` 与 `glow` 两个零件插槽、脚本执行位、`niri msg` reload。随包提供
@@ -550,8 +644,12 @@ aur-helper	paru
 - **noctalia**：Noctalia V5 配置、模板源（模板由 Noctalia 自身渲染）、
   `tools/`（Orbit 启动器与 Wallpaper Picker 及其 Python 包）、`wallpaper-hook.sh`
   与 `mpv-hook.lua`。这些是配置里真实引用到的文件，随模块一起走。
+  另外带 `theme.templates.user.nyxmellow_*` 三节，用 `requires_path` 挂在 fcitx5
+  模块的素材上（见 §3）：注册随配置发布，没装皮肤时 Noctalia 自己跳过。
 - **kitty**：配置、`current-theme.conf` 运行时软链、预设 `transparent`、`pkill -SIGUSR1` reload。
-- **fish**：配置目录、local PATH hook、补全。
+- **fish**：配置目录、local PATH hook、补全、`fish_plugins` 锁文件。因为目录部署是
+  整棵树替换，本模块还 preserve `functions/` 与 fisher 装的四个文件，并把
+  `fish_plugins` 声明成运行时写入——否则下一次 `install fish` 会把插件删掉（§3）。
 - **starship**：单文件配置。
 - **fastfetch**：`config.jsonc`；包、二进制、目录同名，无例外。配置本身不 spawn
   东西，但 `fastfetch` 仍声明为必需程序——否则 `deps` 会对着没人能读的配置报"齐全"。
@@ -562,15 +660,28 @@ aur-helper	paru
 - **zed**：`settings.json` + `keymap.json`。旧引擎把它同时登记在
   `.optional-apps.toml` 里（配置部署、包只进 optdepends）；新项目没有"可选软件"
   这一轴，所以 `zed` 是普通模块，`deps zed` 会装编辑器。代价见 §10。
+- **fcitx5**：NyxMellow 皮肤素材（`assets/fcitx5/`，原子替换进
+  `~/.local/share/fcitx5/themes/nyxmellow/templates/`）+ 雾凇拼音 + 设为默认，三件事
+  拆成 `deploy` / `rime` / `activate` 三个动作，`install` 依次跑完。包需要 AUR
+  （`rime-ice-git`）。全部在 `$HOME` 内，不需要 root。
+- **fisher**：按固定 commit + sha256 取 fisher 引导脚本（三个镜像依次回退），装三个
+  钉住的插件，并把自己写进去的文件记进 `$XDG_STATE_HOME/noctalia-mod/fisher.owned`。
+  锁文件不是本模块钉住的那份就拒绝；已经有 fisher 但没有我们的账本也拒绝（不接管
+  别人装的东西）。卸载只删账本里、且在白名单内的文件。
+- **greeter**：`greetd`（仓库）+ `noctalia-greeter`（AUR），写
+  `/etc/greetd/config.toml`、polkit 规则、`/var/lib/noctalia-greeter`，并切换
+  显示管理器（记下原来那个，失败就放回去）。唯一需要 root 的模块，也是唯一**必须
+  点名**才动系统的模块。详细契约见模块 README。
 
 ## 9. 当前真实进度
 
 ### 已完成
 
-- Bash 入口与模块加载器，八个模块接入。
+- Bash 入口与模块加载器，十一个模块接入（八个配置模块 + 三个系统级模块）。
 - 操作：`list`、`check`、`setup`、`deps`、`plan`、`install`、`preset list|apply|save|edit|delete`、
-  `part list|apply`、`snapshot`、`rollback`、`uninstall`、`status`、`theme sync|status`、
-  `wallpapers deploy|status|remove`、`update`、`doctor`、`bug`、`clean`、`test`。
+  `part list|apply`、`action <模块> <动作>`、`snapshot`、`rollback`、`uninstall`、
+  `status`、`theme sync|status`、`wallpapers deploy|status|remove`、`update`、`doctor`、
+  `bug`、`clean`、`test`。
 - 用户预设：存在 `~/.config/noctalia-mod/presets/<模块>/<名字>/`，与官方预设同一套
   解析顺序（官方优先）；`save` 不带 `__custom__`、覆盖前确认、拒绝保留字与官方同名；
   `delete` / `edit` 只作用于用户预设。活跃预设消失时按 §4 的冻结/回退语义处理。
@@ -602,7 +713,12 @@ aur-helper	paru
 - 运维与自更新（阶段 E）：`doctor` 体检（TSV 输出、有 fail 才非零退出）、`bug`
   诊断导出、`clean` 只清自己的暂存残渣并可选清理快照、`test` 沙箱部署闭环、
   `update` 拉取后换进程重新部署。四条的边界都写在 §11 阶段 E。
-- 行为测试 76 个用例，位于子项目内（`noctalia-mod/tests/`），可独立执行。
+- 系统级可选模块（阶段 F）：`MODULE_KIND='system'` + `actions/*.sh` 三件套契约
+  （§3），`lib/system.sh`（root/systemd/INI 原语）、`lib/network.sh`（多镜像 +
+  sha256 校验的下载）；fcitx5、fisher、greeter 三个模块接入；
+  `noctalia-mod action <模块> <动作>` 跑额外动作；`status` / `doctor` 走模块自己的
+  status 动作；不带参数的 `plan`/`deps`/`install` 只覆盖配置模块。
+- 行为测试 96 个用例，位于子项目内（`noctalia-mod/tests/`），可独立执行。
 - 与旧引擎零耦合：不读旧状态、不依赖旧入口、不修改旧 `install.sh`。子项目是
   独立项目，不接管旧入口（§11 阶段 G 已取消）。
 
@@ -842,8 +958,21 @@ niri 配置 include 它"的说法也不准确——`modules/niri/parts/glow/glow
 - **`clean` 不碰系统级缓存（有意，待裁决）**。旧引擎的 `clean` 会清 pacman 包缓存、
   vacuum journal、删孤立包、跑 TRIM，还要提权；新项目的 `clean` 只管自己的暂存残渣
   与快照。理由：那些是操作系统维护，不是配置管理器的领地，而需要 root 的万金油命令
-  和"非交互优先 + 只动自己的东西"是冲突的。要保留这套能力的话，更适合做成一份显式
-  的系统维护清单（和 §11 阶段 F 的系统级模块同一类），而不是塞回 `clean`。
+  和"非交互优先 + 只动自己的东西"是冲突的。要保留这套能力的话，更适合做成一份显式的
+  系统维护清单（阶段 F 的系统级模块就是它的落点），而不是塞回 `clean`。
+
+- **系统级动作失败不能自动回滚（有意）**。配置模块有部署前快照，系统级模块没有——
+  写 `/etc`、enable 单元这些事没有"换回去"的原子操作。所以契约是：动作自己负责备份与
+  还原（greeter 就是这么写的），引擎在一份 `install` 里只能把配置那半边退回快照。
+  一次 `install greeter niri` 里 greeter 失败，niri 会被退回去，而 greeter 自己半路
+  改掉的东西只能靠它自己的回滚逻辑（它也确实实现了）。这条写进 §3，不是待修项。
+
+- **fish 与 fisher 的 preserve 清单是手工维护的（有意，有漂移风险）**。`install fish`
+  是整棵树替换，所以 fisher 装进去的文件必须在 `fish` 模块的 `MODULE_PRESERVE` 里
+  逐个声明（`functions/` 整目录 + 四个文件）。fisher 上游哪天多写一个文件，那次部署
+  还是会把它删掉——这是"两套机制不合并"的直接后果（§3），代价换来的是安装结果可预测。
+  同理 `fisher` 模块的 `MODULE_FISHER_MANAGED_FILES` 白名单也是手抄的：它决定卸载能删
+  什么，宁可少删也不能多删。
 
 ## 11. 后续迁移顺序
 
@@ -980,11 +1109,43 @@ HOME 下闭环、`check` 全绿、34 个测试通过、无 P0/P1 未关闭）都
   命令只是"在当前环境重铺一次"，这条自带隔离与收敛断言，且不会碰到真实 `~/.config`。
 - **快照/回滚做成事务（已完成）**：见 §6 与 §10 已修复。
 
-### 阶段 F：系统级可选模块
+### 阶段 F：系统级可选模块（已完成）
 
-- fcitx5（含"部署素材"与"设为默认"解耦）
-- greeter、fisher、gtktheme
-- 统一 `install|status|uninstall` 三件套契约。
+这一阶段要解决的是"配置树之外的动作"：写 `/etc`、enable systemd 单元、用 fish 装插件、
+把素材放进 `~/.local/share`。硬塞进"目标目录"只会得到一个假装原子的东西，所以先定契约
+（§3「系统级模块」），再按它接模块：
+
+- **契约（已完成）**：`MODULE_KIND='system'` + `modules/<id>/actions/{install,status,uninstall}.sh`，
+  额外动作由 `MODULE_SYSTEM_EXTRA_ACTIONS` 声明、用 `noctalia-mod action <模块> <动作>` 跑。
+  预检清单由 `MODULE_SYSTEM_PATHS` / `MODULE_SYSTEM_SERVICES` 声明；需要 root 的模块
+  （`MODULE_SYSTEM_PRIVILEGED='yes'`）在动手前统一取一次权限。引擎不替动作回滚——备份与
+  还原是动作自己的责任（系统级动作没有"换回去"这一说），引擎能做的是把配置那半边的
+  事务照旧做完，并在系统动作失败时把它退掉（§5）。
+- **`post_install = "模块:函数"` 的重新设计（已完成）**：不复活这条缝。声明那个包的系统级
+  模块自己就是钩子——`rime-ice-git` 属于 fcitx5 模块，`install fcitx5` 自然就把雾凇拼音
+  配好；旧引擎的 `setup_rime_ice` 在 `install` 动作里有了落点（§3）。
+- **fcitx5（已完成）**：素材、雾凇拼音、"设为默认"三件事拆成三个动作，`install` 依次跑完；
+  `deploy` 只铺素材、不动当前主题。素材随子项目走（`assets/fcitx5/`）。
+  **旧引擎的模板注册不再由本模块改写 noctalia 的配置**：那三节回到 noctalia 模块自己的
+  `noctalia-config.toml`，带 `requires_path`，没装皮肤时 Noctalia 自己跳过。
+- **fisher（已完成）**：固定 commit + sha256 + 三镜像回退的引导下载，所有权账本
+  `fisher.owned`（装到一半也记账，重试安全），锁文件对不上就拒绝，别人装的 fisher 不接管。
+- **greeter（已完成）**：唯一的 root 模块。写 `/etc/greetd/config.toml`、polkit 规则、
+  `/var/lib/noctalia-greeter`，切换显示管理器并记下原来那个（失败放回去），卸载关掉 greetd、
+  把上一个 enable 回来、按备份还原文件。session 命令必须通过可信路径检查（root 拥有、
+  落在 `/usr/bin` 或 `/usr/local/bin`、祖先目录不可被组/其他写）。
+  与旧引擎的一处有意差别：记录文件里没有上一个显示管理器时照样关掉 greetd——旧引擎在这个
+  情况下拒绝卸载，用户会被卡住。
+- **gtktheme（已完成，判定为不需要独立模块）**：旧引擎那个模块只做三件事——注册模板、
+  催渲染、清掉旧版 `gtk-dark.css` 软链。注册本来就随配置发布而不是它装的：旧树里那两节
+  在 `configs/noctalia/noctalia-config.toml:233-241`，新树里在
+  `noctalia-mod/modules/noctalia/files/noctalia-config.toml`；剩下两件是引擎级的 GTK 收尾，
+  和写 `settings.ini` 属同一类，所以收进 `theme_clean_legacy_overrides` 与
+  `theme_trigger_render`，由 `install`/`setup` 的收尾调用。为两个命令再建一个模块，正是
+  这个项目已经砍掉两次的"空转概念"（`hooks.sh`、`profiles/`，见阶段 D 与阶段 C）。
+- **`update` 与系统级模块（已完成）**：`update` 重铺账本里的配置模块与**不需要 root** 的
+  系统级模块（fcitx5、fisher），需要 root 的那个（greeter）只打印"要显式重跑"。更新代码
+  不该顺手改掉这台机器下次开机登录的样子。
 
 ### 阶段 G：已取消（重构后的项目是独立项目，不接管旧项目）
 
@@ -1102,6 +1263,25 @@ python3 noctalia-mod/tests/test_noctalia_mod.py -q   # 直接执行同样可以
 | `update`：脏树 / 非 git 检出 / 非交互无 `--yes` 被拒且不动仓库 | ✅ |
 | `update`：git argv 形状（超时参数、`--ff-only`、未跟踪文件不拦） | ✅ |
 | 回滚是事务：中途失败放回已恢复的模块，并留 `pre-restore` 保护快照 | ✅ |
+| 系统级模块：元数据校验（目标、相对路径、越界、未知 kind、权限标记、缺动作） | ✅ |
+| 系统级模块：不带参数的 `plan`/`deps`/`install` 不隐式选中它们 | ✅ |
+| 系统级模块：预检列出会写的路径、会 enable 的单元、要不要 root | ✅ |
+| 系统级模块：账本只写 kind/enabled/source_version/last_result，不写目标与指纹 | ✅ |
+| 系统级模块：动作失败时配置那半边退回快照、不写账本 | ✅ |
+| 系统级模块：需要 root 的在动手前统一 `sudo -v` | ✅ |
+| `action`：未声明 / 非系统模块 / 未安装 / 重复顶层命令都被拒 | ✅ |
+| `preset` 与 `part` 拒绝系统级模块 | ✅ |
+| `status <模块>` 跑它自己的 status 动作并沿用退出码 | ✅ |
+| `doctor` 用系统模块的 status 动作判断健康 | ✅ |
+| fcitx5：素材 + 雾凇拼音 + 设为默认，卸载只还原自己改过的值 | ✅ |
+| fcitx5：`deploy` 不动当前主题选择、`rime` 退路不覆盖用户的 `user.yaml` | ✅ |
+| fisher：锁文件被改过就拒绝、不接管别人装的 fisher | ✅ |
+| fisher：装到一半失败仍记账（`complete=0`）、重试收敛、卸载只删自己的文件 | ✅ |
+| 下载校验：sha256 不符不留文件、多镜像 argv 带显式超时 | ✅ |
+| greeter：接管登录界面并在卸载时放回原来的显示管理器 | ✅ |
+| greeter：enable greetd 失败时放回上一个显示管理器并回滚文件 | ✅ |
+| greeter：不可信的 session 路径在任何特权操作之前被拒 | ✅ |
+| 沙箱 `test` 只跑核心集（niri + noctalia），系统级模块不走它 | ✅（有意：`test` 是"全新机器核心闭环"的替身） |
 
 每步实现后至少运行（全部零网络秒级）：
 
@@ -1253,22 +1433,24 @@ noctalia-mod/bin/noctalia-mod check
 noctalia-mod/bin/noctalia-mod test
 ```
 
-当前基线：语法 23 个 shell 文件 + 随包 Python 工具 + 4 个 fish 文件全过、shellcheck
-零告警、76 个测试 OK、`check` 全绿、`test` 闭环。
+当前基线：语法 39 个 shell 文件 + 随包 Python 工具 + 4 个 fish 文件全过、shellcheck
+零告警、96 个测试 OK、`check` 全绿、`test` 闭环。
 仓库根 `discover -s tests` 也能过，但**不再覆盖子项目**（测试已迁入，见 §13）。
 
 ### 16.3 当前工作区与 Git 状态
 
-- 分支 `refactor/v3`，远端 tip 与本地 HEAD 都是 `d3040fb`（阶段 E 的交接文档）。
-- **阶段 E 的改动在工作区里、还没提交**：新增 `lib/{doctor,clean,sandbox,update}.sh`，
-  改了 `bin/noctalia-mod`、`lib/snapshot.sh`、测试与两份文档。要提交的话按 §5 的
-  changelog 规矩（子项目现在**不写**用户可见 changelog，见 §12）。
+- 分支 `refactor/v3`，本地 HEAD 是 `2bdab64`（阶段 E：运维与自更新），阶段 A–E 已提交。
+- **阶段 F 的改动在工作区里、还没提交**：新增 `lib/{system,network}.sh`、
+  `modules/{fcitx5,fisher,greeter}/`、`assets/fcitx5/`；改了 `bin/noctalia-mod`、
+  `lib/{common,module-loader,deploy,snapshot,reference-check,doctor,update,theme,sandbox}.sh`、
+  noctalia 的 `noctalia-config.toml`、fish 的 `module.conf`、测试与文档。
+  要提交的话按 §5 的 changelog 规矩（子项目现在**不写**用户可见 changelog，见 §12）。
 - 推远端记得 §16.1 那条 SSH 绕法（`ssh_config.d` 的属主检查坏了，任何 ssh 都起不来）。
 - **子项目是独立项目，不接管旧入口**（阶段 G 已取消，见 §11）：
   - `install.sh`、`nyxuri/`、`configs/`、`assets/` 仍在旧引擎名下服役，本子项目
     不为了自己好过去改它们；
-  - 子项目里那份 `assets/wallpapers/lawson_fuji.webp` 与仓库根那份是重复的，各自
-    随各自的树走，不是待清理的残留；
+  - 子项目里那份 `assets/wallpapers/lawson_fuji.webp`、`assets/fcitx5/` 与仓库根那两份
+    是重复的，各自随各自的树走，不是待清理的残留；
   - 仓库根 `CHANGELOG.md` 里子项目的条目已经撤掉，理由见 §12。
 - 仓库根 `discover -s tests`（旧引擎 471 个用例）现在是绿的；子项目的测试**不在**
   那条发现路径里，要单独跑（见 §16.2）。
@@ -1310,6 +1492,17 @@ noctalia-mod/bin/noctalia-mod test
    调用方要读它就不能写成 `x=$(snapshot_restore …)`——那是子 shell，赋值出不来。
 14. **`git status --porcelain` 默认把未跟踪文件算进"脏"**：拿它挡更新会把一个路过的
    临时文件变成永久拦路虎，要带 `--untracked-files=no` 才是"改过已跟踪文件"。
+15. **`# shellcheck source-path=` 指令必须写在文件最上面**（shebang 之后、任何注释之前）。
+   写在中间时它只对紧跟着的那一条 `source` 生效，同一个文件里后面的 `source` 会被报成
+   SC1091——而零告警基线会因为 info 级提示破掉。`source-path=SCRIPTDIR/../../..` 这类
+   相对路径是"给 shellcheck 找文件用"的，路径拼法要按它算，不是按脚本里的变量算。
+16. **`(($#)) && printf …` 放在 `{ … } > file` 里也一样会返回 1**（PLAN 陷阱 11 的变体）。
+   fisher 的所有权账本在"一个文件都还没装"时正好是空列表，于是写入被判成失败、整个动作
+   退出 1。复合块里要判断有没有参数，用 `if`，不要用 `&&`。
+17. **假命令只挡了 pacman、没挡 paru，测试会真的去编译 AUR 包**。`install fcitx5 --yes`
+   里 `rime-ice-git` 是 AUR，`package_aur_helper` 找的是 PATH 上真实的 `paru`——一次
+   真实 clone + 构建，整套测试从 100 秒涨到 576 秒，还会因为构建失败而红。假命令目录里
+   必须有 `paru`/`yay`（放在单独一层，好让"没有 helper"的用例自己拼 PATH）。
 
 ### 16.5 哪些是实测，哪些还只是推理
 
@@ -1317,7 +1510,7 @@ noctalia-mod/bin/noctalia-mod test
 
 **实测过**：
 
-- 门禁三连（含随包 Python 与 fish 的语法）、76 个测试、`check` 全绿、`test` 闭环。
+- 门禁三连（含随包 Python 与 fish 的语法）、96 个测试、`check` 全绿、`test` 闭环。
 - 旧引擎的 471 个用例仍绿（`discover -s tests`）。
 - `deps → install → plan → snapshot → rollback → uninstall` 在假命令 + 临时 HOME 下闭环。
 - `setup --yes` 从零到配置就位并幂等复跑（树不变、无暂存残留、账本不重复）；
@@ -1352,8 +1545,33 @@ noctalia-mod/bin/noctalia-mod test
   被放回原样、`pre-restore` 保护快照存在、退出码非零（`test_rollback_is_a_transaction`）。
 - **重装后卸载不删配置是实测的**（§10 P2）：连跑两次 `install niri --yes` 再
   `uninstall niri --yes`，`~/.config/niri` 仍在——恢复点是"第二次部署前"的样子。
+- **阶段 F 的行为在隔离环境里验过**（`noctalia-mod/tests/`，96 个用例里的新一批）：
+  fcitx5 从素材铺到雾凇拼音到设为默认、卸载只还原自己改过的两个值且删除自己建的文件；
+  `action fcitx5 deploy` 不动当前主题；fisher 的锁文件拒绝、外来 fisher 拒绝、
+  装到一半仍记账并可重试、卸载只删白名单内的自有文件；下载校验失败不留文件、curl 的
+  argv 带 `--connect-timeout`/`--max-time`；greeter 在补丁过的项目副本 + 假 systemctl
+  上走完"接管 sddm → 重装不动显示管理器 → 卸载放回 sddm"，以及 enable greetd 失败时
+  放回上一个显示管理器并回滚文件；系统级模块的元数据校验、隐式选中被排除、账本字段、
+  失败时配置退回快照、需要 root 时先 `sudo -v`、`action`/`preset`/`part` 的拒绝路径。
+- **假命令必须挡住真实的 AUR helper 这条也是实测的**：不挡的时候
+  `install fcitx5 --yes` 会真的让 `paru` 去 clone + 构建 `rime-ice-git`（§16.4 陷阱 17），
+  顺带得到一条外部事实：本机那份 PKGBUILD 现在构建不过（`melt_eng.*.bin` 缺失）。
 
 **未实测（只有推理或设计）**：
+
+- **greeter 的特权编排没有在真实系统上跑过**：隔离测试用的是项目副本 + 假
+  `systemctl`，把 `/etc/greetd` 等路径重定向进沙箱，并把可信路径检查换成替身
+  （替身存在的原因：本机 `/usr/bin` 的属主被映射成 `nobody`，真实的检查在这里永远
+  拒绝）。所以"在真机上接管登录界面、失败时放回 sddm"仍然是推理；可信检查本身
+  （拒绝用户可写路径与带 shell 元字符的路径）是真代码验过的。
+- **fcitx5 的素材与雾凇拼音没在真机上装过**：`rime-ice-git` 是 AUR 包，本机构建失败
+  （上游 PKGBUILD 与源码树不同步），所以"皮肤在真 fcitx5 里长什么样、雾凇拼音能不能
+  打字"没有依据。
+- **fisher 没在真实网络上跑过**：sha256 与镜像顺序按旧引擎那套写的，测试里 curl 是
+  替身；真实 GitHub / jsDelivr / gh-proxy 的可达性与内容没有验过。
+- **Noctalia 的 `requires_path` 行为只有文档依据**：`05_THEMING_PALETTES_AND_TEMPLATES.md`
+  写着 "Skip template if path does not exist"，据此把 nyxmellow 的三节注册放进了
+  noctalia 模块的配置。没有在真会话里验过"没装 fcitx5 时这三节真的被跳过"。
 
 - 真实机器上的 `deps`/`install`/`setup` 从未由 agent 跑过——agent 侧 `sudo` 不可用，
   安装路径只能用假命令验证（用户自己可以装包：`shellcheck` 就是他 `pacman -S` 装的）。所以"全新机器上能进桌面、快捷键可用、Noctalia 正常渲染"这句结论
@@ -1395,19 +1613,19 @@ noctalia-mod/bin/noctalia-mod test
 ### 16.6 下一步与待裁决
 
 **阶段 A（基座收口）、B（全新系统初始化闭环的代码部分）、C（内容侧补齐）、
-D（运行时能力）、E（运维与自更新）都已完成**，逐阶段的交付与理由见 §11。
-**阶段 G 已取消**：重构后的项目是独立项目，不接管旧入口，也不需要旧引擎退役
-（§11 阶段 G）。下一步是 **阶段 F：系统级可选模块**：
+D（运行时能力）、E（运维与自更新）、F（系统级可选模块）都已完成**，逐阶段的交付与
+理由见 §11。**阶段 G 已取消**：重构后的项目是独立项目，不接管旧入口，也不需要旧引擎
+退役（§11 阶段 G）。
 
-- fcitx5（含"部署素材"与"设为默认"解耦；旧引擎那套 `post_install = "模块:函数"` 要
-  重新设计，见 §3 末尾）
-- greeter、fisher、gtktheme
-- 统一 `install|status|uninstall` 三件套契约。
+§11 里排的迁移顺序到此走完。**没有既定的下一阶段**——剩下的都是下面这几件要用户
+拍板的事，再加上"在真机上用一遍"这条验收。
 
 已拍板的决定散在 §11 各阶段末尾，**别再翻案**；阶段 D 的四项（占位符修法、主题同步
 触发时机、运行时写入的建模、壁纸范围）连同实测证据在 §10 P1-7…P1-9 有完整说明，
 阶段 E 的五项（`doctor` 的退出码语义与检查面、`bug` 只收自己的状态、`clean` 只清自己
-的残渣、`test` 的沙箱边界、`update` 不做状态迁移）在 §11 阶段 E。
+的残渣、`test` 的沙箱边界、`update` 不做状态迁移）在 §11 阶段 E，阶段 F 的六项
+（动作契约、`post_install` 的替代、fcitx5、fisher、greeter、gtktheme 判定）在
+§11 阶段 F。
 
 要用户拍板的几项，不要自己动：
 
@@ -1415,16 +1633,25 @@ D（运行时能力）、E（运维与自更新）都已完成**，逐阶段的�
    第一个文件）。要不要一并修掉？见 §16.4 陷阱一。
 2. **真实机器上的初始化验收**什么时候做、在什么环境下做？agent 侧 `sudo` 不可用
    （§16.1），所以"全新系统能进桌面、快捷键可用、Noctalia 正常渲染"至今仍是推理。
-   阶段 E 的 `test` 解决不了这一条——它不装真包、不进真会话。
+   阶段 E 的 `test` 解决不了这一条——它不装真包、不进真会话；阶段 F 的 greeter 同理，
+   它的特权编排只在补丁过的项目副本 + 假 systemctl 上验过（§16.5）。
 3. **重装之后卸载不删配置**（§10 P2）：要不要在账本里多存一个 `first_snapshot`，
    让 `uninstall` 恢复"本项目第一次动它之前"的状态？
 4. **`clean` 的系统级缓存清理要不要保留**（§10 P2）：旧引擎那套 pacman/journal/TRIM
-   现在没有对应物。要做的话更适合放进阶段 F 的系统级模块，而不是塞回 `clean`。
+   现在没有对应物。阶段 F 建了系统级模块这套机制，要做的话现在有落点了（一个
+   `maintenance` 模块），但它是操作系统维护而不是配置管理，仍然待裁决。
 5. **模式切换时的实时主题同步怎么接**（§4）：它要指向一个能执行 `theme sync` 的命令，
    而现在这个项目没有二进制在 PATH 上。可选做法：(a) 随 noctalia 模块提供一个
    `theme-sync.sh`，它找 PATH 上的 `noctalia-mod`，找不到就静默退出（等于在没上 PATH
    的机器上不生效）；(b) 干脆不接，靠每次部署收尾同步；(c) 先把 `bin/` 放进 PATH
    这件事定下来再接 hook——那已经是"发布方式"，不属于子项目内部。
+6. **要不要在真机上装 fcitx5 模块**（§16.5）：它的 AUR 依赖 `rime-ice-git` 在本机
+   构建失败过（`melt_eng.*.bin` 缺失，`install` 报错退出），那是**上游 PKGBUILD 与当前
+   源码树不同步**，不是本模块的缺陷；但 agent 侧无法确认修好没有。装之前先自己
+   `paru -S rime-ice-git` 试一次。
+
+开工前的固定动作：`git status` 看树、按 §16.2 跑门禁三连建基线、读本节的
+§16.1–§16.5，然后才动手。
 
 开工前的固定动作：`git status` 看树、按 §16.2 跑门禁三连建基线、读本节的
 §16.1–§16.5，然后才动手。

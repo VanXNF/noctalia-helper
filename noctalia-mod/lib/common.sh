@@ -32,6 +32,20 @@ is_safe_relative_path() {
     done
 }
 
+# 系统级模块要声明配置根之外的绝对路径（PLAN §11 阶段 F）：/etc/greetd/config.toml、
+# $HOME/.local/share/fcitx5/themes/nyxmellow。它们和相对路径一样不能靠字符串猜——
+# 空段、`.`、`..` 一律拒绝，以免一个声明把 rm -rf 指到别处。
+is_safe_absolute_path() {
+    local path=${1-} rest segment
+    [[ $path == /* && $path != *$'\n'* && $path != *$'\r'* ]] || return 1
+    rest=${path#/}
+    [[ -n $rest ]] || return 1
+    IFS='/' read -r -a _path_segments <<< "$rest"
+    for segment in "${_path_segments[@]}"; do
+        [[ -n $segment && $segment != '.' && $segment != '..' ]] || return 1
+    done
+}
+
 is_safe_package_name() {
     [[ $1 =~ ^[A-Za-z0-9@._+:-]+$ ]]
 }
