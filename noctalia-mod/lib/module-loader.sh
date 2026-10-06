@@ -144,8 +144,10 @@ module_part_default() {
     printf '%s\n' "${!variable:-default}"
 }
 
+# 非 default 的 preset 解析顺序（PLAN §4）：官方在前，用户在后。同名时官方胜出，
+# 因为官方预设是随仓库发布的契约；`preset save` 也会拒绝占用官方的名字。
 module_source_for_preset() {
-    local root=$1 preset=$2 source
+    local root=$1 preset=$2 source dir
     if [[ $preset == default ]]; then
         source="$root/$MODULE_FILES/$MODULE_TARGET"
         if [[ -f $source || -L $source ]]; then
@@ -156,13 +158,18 @@ module_source_for_preset() {
         return
     fi
     is_safe_identifier "$preset" || return 1
-    [[ -d $root/presets/$preset ]] || return 1
-    source="$root/presets/$preset/$MODULE_TARGET"
-    if [[ -f $source || -L $source ]]; then
-        printf '%s\n' "$source"
-    else
-        printf '%s/presets/%s\n' "$root" "$preset"
-    fi
+    # 预设目录本身不接受软链：否则"预设"就能变成指向仓库外任意路径的跳板。
+    for dir in "$root/presets/$preset" "$(preset_user_dir "$MODULE_ID" "$preset")"; do
+        [[ -d $dir && ! -L $dir ]] || continue
+        source="$dir/$MODULE_TARGET"
+        if [[ -f $source || -L $source ]]; then
+            printf '%s\n' "$source"
+        else
+            printf '%s\n' "$dir"
+        fi
+        return 0
+    done
+    return 1
 }
 
 module_source_for_part() {

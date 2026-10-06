@@ -138,12 +138,12 @@ noctalia-mod/
 │   ├── state.sh           # 状态账本
 │   ├── snapshot.sh        # 快照、回滚、清理
 │   ├── deploy.sh          # 暂存构建、原子替换、保留规则
+│   ├── preset.sh          # 用户预设的存取与预设消失语义
 │   ├── reference-check.sh # 引用与程序声明的静态自洽校验
 │   └── module-loader.sh   # 模块元数据加载与校验
 ├── modules/
 │   └── <module>/          # 见 §3
 ├── tests/                 # 子项目自带测试（自包含）
-├── profiles/              # 预留：跨模块 preset 组合，见 §4
 ├── PLAN.md                # 本文档：方案与进度
 └── README.md              # 使用说明
 ```
@@ -164,8 +164,8 @@ modules/<module>/
 | 目标 | 现状 |
 |---|---|
 | `tests/` 在子项目内 | `已完成`：`noctalia-mod/tests/`，自带 `utils.py`，不 import 旧引擎 |
-| `profiles/` 可用 | 空目录，仅预留（阶段 C 预设定稿后再决定是否需要） |
-| 各模块 `README.md` 描述协议与例外 | `已完成`：五个模块各自写了目标、包、preserve、零件与例外 |
+| `profiles/` 可用 | 已判定**不需要**并删除空目录（§11 阶段 C）；用户预设按模块存放就够表达"哪个变体" |
+| 各模块 `README.md` 描述协议与例外 | `已完成`：八个模块各自写了目标、包、preserve、零件与例外 |
 
 ## 3. 模块协议
 
@@ -249,6 +249,9 @@ modules/<module>/
   这类引用只能人工保证。
 - 拼接、循环生成的路径。
 - Python/其它语言里的 `os.path.join(A, B, C)` 形式。
+- **用户预设不在扫描范围内**：`check` 只扫仓库里的模块源（`files/`、`presets/`、
+  `parts/`）。用户预设是用户自己的内容，让仓库体检去为用户数据报错是错的取向；
+  那里的悬空引用要等 `install` 部署时才暴露。
 - **shipped 工具的运行时依赖是否已声明**：`MODULE_REPO_PACKAGES` 与工具实际
   import 之间没有自动校验。第一个实例是 noctalia 的 `import cairo`，需要
   `python-cairo`——迁移 tools 时才暴露出来（见 §10 已修复）。
@@ -258,14 +261,42 @@ modules/<module>/
 
 ## 4. 配置层次与保留规则
 
-三层模型不变，改为模块内部管理：
+四层模型不变，改为模块内部管理：
 
 1. 默认配置：`modules/<module>/files/`
 2. 官方 preset：`modules/<module>/presets/<name>/`（稀疏覆盖，未重写的文件从底版继承）
-3. 用户自定义：目标路径中的 `__custom__` 文件或目录
+3. 用户 preset：`$XDG_CONFIG_HOME/noctalia-mod/presets/<module>/<name>/`
+4. 用户自定义：目标路径中的 `__custom__` 文件或目录
 
-preset 状态按模块保存。第一阶段不做全局不可拆分的 preset。`profiles/` 预留给
-"多个模块 preset 的组合"，在 §11 阶段 C 需要时再实现，现在不建空概念。
+preset 状态按模块保存（账本里的 `preset` 键）。第一阶段不做全局不可拆分的 preset；
+`profiles/` 那一层跨模块组合已判定不需要，见 §11 阶段 C。
+
+**用户预设归 config 不归 state**：它是用户手编、值得自己备份的内容，而 state 放的是
+账本、快照、锁这类机器状态。路径与旧引擎的 `~/.config/nyxuri/presets/` 同构。
+
+规则：
+
+- **解析顺序官方优先**：同名时官方预设胜出（它是随仓库发布的契约），`preset save`
+  直接拒绝占用官方名字，不给"永远不生效的同名目录"留活路。
+- **`default` 是保留字**：它指随包发布的默认配置。`apply default` 是正经操作（把模块
+  铺回默认），但 `save` / `edit` / `delete` 都不接受这个名字。
+- **名字必须是标识符**（`[a-z0-9][a-z0-9-]*`），与模块 id、零件名同一套校验。
+- **`save` 不带走 `__custom__`**：那是用户的实时覆盖，每次部署都会被重新继承回来，
+  存进预设只会让人误以为它进了"版本"。软链按链接存（如 kitty 的 `current-theme.conf`）。
+  覆盖同名用户预设前必须确认一次（`--yes` 跳过）——那是不可逆的用户内容。
+- **官方预设不可 `edit` / `delete`**：它在仓库里，不在用户目录里。
+- **预设目录本身不接受软链**：否则"预设"就能变成指向仓库外任意路径的跳板。
+- **预检里显式暴露**：活跃 preset 消失时 `plan`/`setup` 打印
+  `preset-missing\t<模块>\t<preset>\t<frozen|reset>`，不靠用户自己从账本里发现。
+
+**活跃 preset 消失后的语义**（与旧引擎一致，都是刻意选择）：
+
+| 情形 | 处理 | 为什么 |
+|---|---|---|
+| 目标还在 | **冻结**：跳过该模块的部署，账本不动，警告 | 绝不静默把用户的配置改回默认，那等于毁数据 |
+| 目标也没了 | 回退 `default` 重铺，成功后才写账本 | 没有东西可丢；写状态放在部署之后，失败就什么都不留 |
+
+冻结的模块**不写账本**：重算指纹会把漂移一起抹掉，等于替用户宣布"没变化"。
 
 目标根目录默认 `~/.config/`（跟随 `XDG_CONFIG_HOME`）。状态目录：
 
@@ -275,6 +306,12 @@ $XDG_STATE_HOME/noctalia-mod/         # 回退 $HOME/.local/state/noctalia-mod/
 ├── snapshots/<snapshot_id>/          # 快照
 ├── audit.log                         # 操作审计
 └── lock                              # 项目锁
+```
+
+用户预设不在状态目录里，它是配置：
+
+```text
+$XDG_CONFIG_HOME/noctalia-mod/presets/<module>/<name>/
 ```
 
 **暂存目录不在 cache**：原子替换要求同一文件系统，暂存目录建在目标父目录下的
@@ -430,7 +467,7 @@ aur-helper	paru
 
 ## 8. 已接入模块
 
-`已完成`：niri、noctalia、kitty、fish、starship。
+`已完成`：niri、noctalia、kitty、fish、starship、fastfetch、xdg-desktop-portal、zed。
 
 - **niri**：默认配置、`monitor.kdl` / `effects.kdl` / `colors.kdl` 等 preserve、
   `effects` 与 `glow` 两个零件插槽、脚本执行位、`niri msg` reload。随包提供
@@ -442,17 +479,27 @@ aur-helper	paru
 - **kitty**：配置、`current-theme.conf` 运行时软链、预设 `transparent`、`pkill -SIGUSR1` reload。
 - **fish**：配置目录、local PATH hook、补全。
 - **starship**：单文件配置。
-
-`待办`：fastfetch、xdg-desktop-portal、zed（§11 阶段 C）。
+- **fastfetch**：`config.jsonc`；包、二进制、目录同名，无例外。配置本身不 spawn
+  东西，但 `fastfetch` 仍声明为必需程序——否则 `deps` 会对着没人能读的配置报"齐全"。
+- **xdg-desktop-portal**：`portals.conf` + `niri-portals.conf` 两份路由。配置里
+  `[preferred]` 点名 gnome / gtk 两个后端与 gnome-keyring，所以这四个包都归本模块
+  声明。portal 与后端都装在 `/usr/lib`、由 D-Bus 激活，因此**不**写
+  `MODULE_REQUIRED_COMMANDS`（`command -v` 看不到它们，声明了就是永久假警报）。
+- **zed**：`settings.json` + `keymap.json`。旧引擎把它同时登记在
+  `.optional-apps.toml` 里（配置部署、包只进 optdepends）；新项目没有"可选软件"
+  这一轴，所以 `zed` 是普通模块，`deps zed` 会装编辑器。代价见 §10。
 
 ## 9. 当前真实进度
 
 ### 已完成
 
-- Bash 入口与模块加载器，五个模块接入。
+- Bash 入口与模块加载器，八个模块接入。
 - 操作：`list`、`check`、`setup`、`deps`、`plan`、`install`、
-  `preset list|apply`、`part list|apply`、`snapshot`、`rollback`、`uninstall`、
-  `status`。
+  `preset list|apply|save|edit|delete`、`part list|apply`、`snapshot`、`rollback`、
+  `uninstall`、`status`。
+- 用户预设：存在 `~/.config/noctalia-mod/presets/<模块>/<名字>/`，与官方预设同一套
+  解析顺序（官方优先）；`save` 不带 `__custom__`、覆盖前确认、拒绝保留字与官方同名；
+  `delete` / `edit` 只作用于用户预设。活跃预设消失时按 §4 的冻结/回退语义处理。
 - 引导入口 `setup`：依赖与配置合成一份清单、一次确认、依次跑完，无参数时默认
   核心集（niri + noctalia）；`--with <程序>` 加装模块声明过的可选程序；跑完落
   一份收尾总结（装了什么、铺到哪、怎么退）。`setup` 可重复执行并收敛。
@@ -472,7 +519,7 @@ aur-helper	paru
 以下项目曾在本文档中被写成"已完成"，实际不成立，已订正：
 
 - 测试**不在**子项目内，且 §13 的覆盖清单只满足约三分之一。
-- `profiles/` 只有空目录，没有任何实现。
+- `profiles/` 只有空目录，没有任何实现（现已判定不需要并删除，见 §11 阶段 C）。
 - `hooks.sh` 在 §3 声明过，引擎里没有任何实现。
 - 没有做过新旧部署结果的隔离 HOME 对照验收。
 - 环境检查只打印信息，不阻断（现已明确为设计选择）。
@@ -599,6 +646,13 @@ noctalia 配置把 `wallpaper.directory` / `video_directory` 指向
 
 #### P2 其它
 
+- **迁移取舍：`zed` 与 portal 后端的包不再是"可选"**。旧引擎把 zed 登记在
+  `.optional-apps.toml`（包只进 optdepends），portal 后端则完全没人声明。新项目没有
+  "可选软件"这一轴，模块要么声明包要么不声明，所以 `deps --yes` / `install --yes`
+  会把 zed 编辑器与两个 portal 后端一起装上。走 §0 的 `setup` 引导路径不受影响
+  （默认只有 niri + noctalia）。想恢复"配置在、包不在"的状态，就得显式把包从模块
+  清单里拿掉，但那样 `check` 的模块自足契约也就断了。
+
 - **待验证**：Noctalia 的内置 kitty 模板是否会写进 `~/.config/kitty/`。如果会，
   被写到的文件必须声明为 preserve，否则每次 `plan` 都会误报 drift。目前没有证据，
   不凭猜测改声明——阶段 B 的初始化验收会暴露它（`plan` 出现 drift 即为信号）。
@@ -659,14 +713,27 @@ HOME 下闭环、`check` 全绿、34 个测试通过、无 P0/P1 未关闭）都
   锁的就是它）。在没有运行中会话的 TTY 里跑 `setup` 会把刚铺的配置回滚掉——
   这是已知约束，不是待修缺陷。
 
-### 阶段 C：内容侧补齐（下一步）
+### 阶段 C：内容侧补齐（已完成）
 
-- 迁移剩余配置：fastfetch、xdg-desktop-portal、zed。
-- 用户预设：`preset save` / `edit` / `delete`（官方预设优先，`default` 为保留字）。
-- 预设定稿后再决定 `profiles/` 是否需要，不需要就删掉空目录。
-- 补齐 kitty/niri 的预设与零件对等（对照旧引擎当前能力）。
+- **迁移剩余配置（已完成）**：fastfetch、xdg-desktop-portal、zed 三个模块接入，
+  连同前面五个共八个。迁移时按既有约定改写：项目名 `Nyxuri` → `Noctalia Mod`、
+  运行时标识 `nyxuri` → `noctalia-mod`、去行尾空格；旧引擎的 `.module.toml`
+  不随模块走（那是给旧引擎读的，不是配置）。
+  - portal 模块按配置点名的后端补齐四个包（见 §8），这是与旧引擎的有意差异。
+  - zed 从"可选软件"变成普通模块，代价记在 §10 P2。
+- **用户预设（已完成）**：`preset save` / `edit` / `delete`，加 `list` 显示
+  来源与当前活跃项。存储位置、解析顺序、保留字、覆盖确认、活跃预设消失后的
+  冻结/回退语义都在 §4。比旧引擎多做的两处：覆盖同名用户预设前确认一次；
+  预检里直接打印 `preset-missing` 行。
+- **kitty/niri 的预设与零件对等（已完成，实为早已满足）**：对照旧引擎的
+  `configs/kitty/__presets__/transparent/` 与 `configs/niri/__presets__/`（后者只有
+  `effects`/`glow` 两个零件源目录，没有官方预设），新项目的 `presets/` 与 `parts/`
+  已逐一对上，无需补内容。
+- **`profiles/` 去留（已完成）**：结论是**不需要**，空目录已删。理由：用户预设按模块
+  存放就已经能表达"某个模块的哪个变体"，再叠一层跨模块组合是空概念；真需要"一次切
+  多个模块"时，`setup <模块...>` 加各自 `preset apply` 已经够用。
 
-### 阶段 D：运行时能力
+### 阶段 D：运行时能力（下一步）
 
 - 模板渲染与主题同步（旧引擎的 `theme` 与 `_phase_render_templates`）。
 - 壁纸部署与 managed 账本，并收掉 §10 P1-5 与 P2 里的壁纸相关死代码。
@@ -745,7 +812,16 @@ python3 noctalia-mod/tests/test_noctalia_mod.py -q   # 直接执行同样可以
 | 文件与目录原子替换 | ✅ |
 | `__custom__` 文件、目录、嵌套路径保留 | ✅ |
 | preserve 路径保留（含软链接按链接保留） | 部分 |
-| preset 切换 | ✅ |
+| preset 切换（官方） | ✅ |
+| 用户预设：save 不带 `__custom__`、软链按链接存 | ✅ |
+| 用户预设：保留字 / 官方同名 / 非法名被拒 | ✅ |
+| 用户预设：覆盖同名前必须确认 | ✅ |
+| 用户预设：delete / edit 只动用户预设、清理空目录 | ✅ |
+| 用户预设：单文件目标（starship）存取往返 | ✅ |
+| 预设消失：目标还在→冻结且不动账本；目标没了→回退 default | ✅ |
+| 预设清单区分来源与当前活跃项 | ✅ |
+| 迁移内容无旧引擎残留（`.module.toml`、项目名） | ✅ |
+| portal 模块按配置点名安装后端 | ✅ |
 | 零件选择与恢复 | ✅ |
 | 快照创建与回滚 | ✅ |
 | 快照清理：按创建时间保留 | ✅ |
@@ -774,6 +850,11 @@ python3 noctalia-mod/tests/test_noctalia_mod.py -q   # 直接执行同样可以
 # 语法：必须逐个文件跑。`bash -n a b c` 只检查 a，b/c 会被当成位置参数静默忽略。
 find noctalia-mod -type f \( -name '*.sh' -o -name 'noctalia-mod' \) -print0 |
     xargs -0 -n1 bash -n
+
+# 随包发布的 Python 工具也要过语法，否则要到用户点开 Orbit / 壁纸选择器才发现。
+# pyc 必须重定向出仓库：__pycache__ 落在 files/ 里会被一起拷进 ~/.config。
+PYTHONPYCACHEPREFIX=${TMPDIR:-/tmp}/noctalia-mod-pycache \
+    python3 -m compileall -q noctalia-mod/modules/noctalia/files/tools
 
 # 静态分析：-x 必须带，否则 source 进来的 lib 根本不参与分析。
 # 用 find 收集，不要手写 glob —— 漏掉 modules/noctalia/files/wallpaper-hook.sh
@@ -873,9 +954,11 @@ PATH 前面（见 §16.5 的做法），否则 `setup --yes` 会真的去装包�
 ```bash
 cd /home/victorxu/Projects/workspace/noctalia-helper
 
-# 1. 语法：必须逐个文件跑（见 §16.4 陷阱一）
+# 1. 语法：shell 必须逐个文件跑（见 §16.4 陷阱一），随包 Python 工具一起过
 find noctalia-mod -type f \( -name '*.sh' -o -name 'noctalia-mod' \) -print0 |
     xargs -0 -n1 bash -n
+PYTHONPYCACHEPREFIX=${TMPDIR:-/tmp}/noctalia-mod-pycache \
+    python3 -m compileall -q noctalia-mod/modules/noctalia/files/tools
 
 # 2. 静态分析：-x 必须带（见 §16.4 陷阱二）
 mapfile -t shells < <(find noctalia-mod -type f -name '*.sh' | sort)
@@ -886,7 +969,7 @@ python3 -m unittest discover -s noctalia-mod/tests -q
 noctalia-mod/bin/noctalia-mod check
 ```
 
-当前基线：语法 16 个入口全过、shellcheck 零告警、41 个测试 OK、`check` 全绿。
+当前基线：语法 17 个入口全过、shellcheck 零告警、53 个测试 OK、`check` 全绿。
 仓库根 `discover -s tests` 也能过，但**不再覆盖子项目**（测试已迁入，见 §13）。
 
 ### 16.3 当前工作区状态
@@ -918,7 +1001,7 @@ noctalia-mod/bin/noctalia-mod check
 
 写结论前先看这张表，别把推理当既成事实。
 
-**实测过**：门禁三连、41 个测试、`check` 全绿、`deps → install → plan → uninstall`
+**实测过**：门禁三连、53 个测试、`check` 全绿、`deps → install → plan → uninstall`
 在假命令 + 临时 HOME 下闭环、`setup --yes` 从零到配置就位并幂等复跑（树不变、无
 暂存残留、账本不重复）、`setup --with` 的 argv 形状与未声明名字被拒、`plan niri` /
 `deps niri` 不再报别的模块的程序、drift 的四种情形（受管改动报、`__custom__`/preserve/
@@ -943,9 +1026,9 @@ noctalia-mod/bin/noctalia-mod check
 
 ### 16.6 下一步与待裁决
 
-阶段 A（基座收口）与阶段 B（全新系统初始化闭环的代码部分）**已完成**，见 §11。
-下一步是**阶段 C：内容侧补齐**——迁移 fastfetch、xdg-desktop-portal、zed，做
-`preset save|edit|delete`，再定 `profiles/` 的去留。
+阶段 A（基座收口）、阶段 B（全新系统初始化闭环的代码部分）与阶段 C（内容侧补齐）
+**已完成**，见 §11。下一步是**阶段 D：运行时能力**——模板渲染与主题同步、壁纸部署
+与 managed 账本，并收掉 §10 P1-5 与 P2 里的壁纸死代码。
 
 阶段 B 已拍板的四项（`install` 默认值、可选程序交互形态、`nautilus` 定位、收尾
 总结）记在 §11，别再翻案。仍然开着的：

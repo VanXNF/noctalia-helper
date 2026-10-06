@@ -21,6 +21,18 @@ cache_root() {
     printf '%s\n' "${XDG_CACHE_HOME:-$(home_dir)/.cache}/noctalia-mod"
 }
 
+# 用户预设（PLAN §4）：用户手编、值得自己备份的内容，所以归 config 而不是 state
+# ——state 放的是账本、快照、锁这类机器状态。
+preset_root() {
+    printf '%s/noctalia-mod/presets\n' "$(config_root)"
+}
+
+preset_user_dir() {
+    local module=${1-} name=${2-}
+    is_safe_identifier "$module" && is_safe_identifier "$name" || return 1
+    printf '%s/%s/%s\n' "$(preset_root)" "$module" "$name"
+}
+
 module_root() {
     printf '%s/modules/%s\n' "$(project_root)" "$1"
 }

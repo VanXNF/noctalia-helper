@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -91,7 +92,7 @@ printf '\\n' >> \"$FAKE_LOG\"
             self.assertIn("without --yes", refused.stderr)
             self.assertFalse((env.home / ".config" / "niri").exists())
 
-    def test_all_first_stage_modules_install_in_one_transaction(self) -> None:
+    def test_all_modules_install_in_one_transaction(self) -> None:
         with TempEnv() as env:
             fake_bin, _ = self._fake_commands(env)
             installed = self._run(env, fake_bin, "install", "--yes")
@@ -102,6 +103,252 @@ printf '\\n' >> \"$FAKE_LOG\"
             self.assertTrue((config / "kitty" / "kitty.conf").is_file())
             self.assertTrue((config / "fish" / "config.fish").is_file())
             self.assertTrue((config / "starship.toml").is_file())
+            self.assertTrue((config / "fastfetch" / "config.jsonc").is_file())
+            self.assertTrue((config / "xdg-desktop-portal" / "portals.conf").is_file())
+            self.assertTrue((config / "zed" / "settings.json").is_file())
+
+    def test_migrated_content_modules_carry_no_old_engine_leftovers(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            installed = self._run(
+                env, fake_bin, "install", "fastfetch", "xdg-desktop-portal", "zed", "--yes"
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            config = env.home / ".config"
+            # 旧引擎的 manifest 是给旧引擎读的，不是配置，不该进 ~/.config。
+            self.assertFalse((config / "xdg-desktop-portal" / ".module.toml").exists())
+            # 项目名残留会顺着随包内容一路部署下去，所以正面盯一下。
+            fastfetch = (config / "fastfetch" / "config.jsonc").read_text()
+            self.assertIn("Noctalia Mod", fastfetch)
+            self.assertNotIn("Nyxuri", fastfetch)
+
+    def test_portal_module_installs_the_backends_its_config_names(self) -> None:
+        """Routing that points at gnome/gtk is a lie unless those backends get installed."""
+        with TempEnv() as env:
+            fake_bin, log = self._fake_commands(env)
+            result = self._run(env, fake_bin, "deps", "xdg-desktop-portal", "--yes")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            install_line = next(
+                line for line in log.read_text().splitlines() if line.startswith("sudo <pacman> <-S>")
+            )
+            installed = set(re.findall(r"<([^>]*)>", install_line))
+            for package in (
+                "xdg-desktop-portal",
+                "xdg-desktop-portal-gtk",
+                "xdg-desktop-portal-gnome",
+                "gnome-keyring",
+            ):
+                self.assertIn(package, installed)
+
+    def _kitty_preset_dir(self, env: TempEnv, name: str) -> Path:
+        return env.home / ".config" / "noctalia-mod" / "presets" / "kitty" / name
+
+    def test_preset_save_writes_a_user_preset_without_custom_files(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            installed = self._run(env, fake_bin, "install", "kitty", "--yes")
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            kitty = env.home / ".config" / "kitty"
+            with (kitty / "kitty.conf").open("a", encoding="utf-8") as handle:
+                handle.write("\n# my own edit\n")
+            (kitty / "__custom__.conf").write_text("private\n", encoding="utf-8")
+
+            saved = self._run(env, fake_bin, "preset", "kitty", "save", "mine", "--yes")
+            self.assertEqual(saved.returncode, 0, saved.stderr)
+            preset = self._kitty_preset_dir(env, "mine")
+            self.assertIn("# my own edit", (preset / "kitty.conf").read_text())
+            self.assertTrue(
+                (preset / "current-theme.conf").is_symlink(),
+                "runtime symlinks travel with the preset as links",
+            )
+            self.assertFalse(
+                (preset / "__custom__.conf").exists(),
+                "__custom__ is the user's live override and does not belong in a preset",
+            )
+
+    def test_preset_save_refuses_reserved_and_official_names(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            self._run(env, fake_bin, "install", "kitty", "--yes")
+
+            reserved = self._run(env, fake_bin, "preset", "kitty", "save", "default", "--yes")
+            self.assertNotEqual(reserved.returncode, 0)
+            self.assertIn("reserved", reserved.stderr)
+
+            official = self._run(env, fake_bin, "preset", "kitty", "save", "transparent", "--yes")
+            self.assertNotEqual(official.returncode, 0)
+            self.assertIn("shipped by the repository", official.stderr)
+            self.assertFalse(self._kitty_preset_dir(env, "transparent").exists())
+
+            bad_name = self._run(
+                env, fake_bin, "preset", "kitty", "save", "Not-An-Identifier", "--yes"
+            )
+            self.assertNotEqual(bad_name.returncode, 0)
+
+    def test_preset_list_reports_source_and_active(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            self._run(env, fake_bin, "install", "kitty", "--yes")
+            self._run(env, fake_bin, "preset", "kitty", "save", "mine", "--yes")
+
+            listed = self._run(env, fake_bin, "preset", "kitty", "list")
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            self.assertIn("preset\tsource\tactive", listed.stdout)
+            self.assertIn("default\tofficial\tyes", listed.stdout)
+            self.assertIn("transparent\tofficial\tno", listed.stdout)
+            self.assertIn("mine\tuser\tno", listed.stdout)
+
+            applied = self._run(env, fake_bin, "preset", "kitty", "apply", "mine", "--yes")
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            after = self._run(env, fake_bin, "preset", "kitty", "list")
+            self.assertIn("mine\tuser\tyes", after.stdout)
+            self.assertIn("default\tofficial\tno", after.stdout)
+
+    def test_preset_apply_deploys_the_saved_content(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            config = env.home / ".config"
+            self._run(env, fake_bin, "install", "kitty", "--yes")
+            with (config / "kitty" / "kitty.conf").open("a", encoding="utf-8") as handle:
+                handle.write("\n# saved variant\n")
+            self._run(env, fake_bin, "preset", "kitty", "save", "mine", "--yes")
+
+            reset = self._run(env, fake_bin, "preset", "kitty", "apply", "default", "--yes")
+            self.assertEqual(reset.returncode, 0, reset.stderr)
+            self.assertNotIn("# saved variant", (config / "kitty" / "kitty.conf").read_text())
+
+            applied = self._run(env, fake_bin, "preset", "kitty", "apply", "mine", "--yes")
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            self.assertIn("# saved variant", (config / "kitty" / "kitty.conf").read_text())
+
+    def test_preset_save_overwrite_asks_first(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            config = env.home / ".config"
+            self._run(env, fake_bin, "install", "kitty", "--yes")
+            self._run(env, fake_bin, "preset", "kitty", "save", "mine", "--yes")
+            preset = self._kitty_preset_dir(env, "mine")
+            original = (preset / "kitty.conf").read_text()
+
+            with (config / "kitty" / "kitty.conf").open("a", encoding="utf-8") as handle:
+                handle.write("\n# second version\n")
+            refused = self._run(env, fake_bin, "preset", "kitty", "save", "mine")
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("without --yes", refused.stderr)
+            self.assertEqual(
+                (preset / "kitty.conf").read_text(),
+                original,
+                "a refused overwrite must not touch the preset",
+            )
+
+            overwritten = self._run(env, fake_bin, "preset", "kitty", "save", "mine", "--yes")
+            self.assertEqual(overwritten.returncode, 0, overwritten.stderr)
+            self.assertIn("# second version", (preset / "kitty.conf").read_text())
+
+    def test_preset_delete_refuses_official_and_warns_when_active(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            self._run(env, fake_bin, "install", "kitty", "--yes")
+            self._run(env, fake_bin, "preset", "kitty", "save", "mine", "--yes")
+            self._run(env, fake_bin, "preset", "kitty", "apply", "mine", "--yes")
+
+            official = self._run(env, fake_bin, "preset", "kitty", "delete", "transparent")
+            self.assertNotEqual(official.returncode, 0)
+            self.assertIn("shipped by the repository", official.stderr)
+
+            deleted = self._run(env, fake_bin, "preset", "kitty", "delete", "mine")
+            self.assertEqual(deleted.returncode, 0, deleted.stderr)
+            self.assertIn("active", deleted.stderr)
+            self.assertFalse(self._kitty_preset_dir(env, "mine").exists())
+            self.assertFalse(
+                (env.home / ".config" / "noctalia-mod" / "presets" / "kitty").exists(),
+                "an emptied module directory should not be left behind",
+            )
+
+    def test_preset_edit_needs_a_terminal_and_refuses_official(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            self._run(env, fake_bin, "install", "kitty", "--yes")
+            self._run(env, fake_bin, "preset", "kitty", "save", "mine", "--yes")
+
+            official = self._run(env, fake_bin, "preset", "kitty", "edit", "transparent")
+            self.assertNotEqual(official.returncode, 0)
+            self.assertIn("shipped by the repository", official.stderr)
+
+            headless = self._run(env, fake_bin, "preset", "kitty", "edit", "mine")
+            self.assertNotEqual(headless.returncode, 0)
+            self.assertIn(str(self._kitty_preset_dir(env, "mine")), headless.stderr)
+
+    def test_preset_save_and_apply_for_a_single_file_target(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            target = env.home / ".config" / "starship.toml"
+            self._run(env, fake_bin, "install", "starship", "--yes")
+            shipped = target.read_text()
+            with target.open("a", encoding="utf-8") as handle:
+                handle.write("\n# saved variant\n")
+
+            saved = self._run(env, fake_bin, "preset", "starship", "save", "mine", "--yes")
+            self.assertEqual(saved.returncode, 0, saved.stderr)
+            preset_file = (
+                env.home / ".config" / "noctalia-mod" / "presets" / "starship" / "mine"
+                / "starship.toml"
+            )
+            self.assertTrue(preset_file.is_file())
+
+            self._run(env, fake_bin, "preset", "starship", "apply", "default", "--yes")
+            self.assertEqual(target.read_text(), shipped)
+            applied = self._run(env, fake_bin, "preset", "starship", "apply", "mine", "--yes")
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            self.assertIn("# saved variant", target.read_text())
+
+    def test_install_freezes_a_module_whose_preset_disappeared(self) -> None:
+        """PLAN §4: never silently fall back to default over the user's own config."""
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            config = env.home / ".config"
+            state = env.home / ".local" / "state" / "noctalia-mod" / "modules" / "kitty.state"
+            self._run(env, fake_bin, "install", "kitty", "--yes")
+            with (config / "kitty" / "kitty.conf").open("a", encoding="utf-8") as handle:
+                handle.write("\n# mine\n")
+            self._run(env, fake_bin, "preset", "kitty", "save", "mine", "--yes")
+            self._run(env, fake_bin, "preset", "kitty", "apply", "mine", "--yes")
+            self._run(env, fake_bin, "preset", "kitty", "delete", "mine")
+            before_state = state.read_text()
+            before_config = (config / "kitty" / "kitty.conf").read_text()
+
+            planned = self._run(env, fake_bin, "plan", "kitty")
+            self.assertEqual(planned.returncode, 0, planned.stderr)
+            self.assertIn("preset-missing\tkitty\tmine\tfrozen", planned.stdout)
+
+            installed = self._run(env, fake_bin, "install", "kitty", "--yes")
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            self.assertIn("no longer exists", installed.stderr)
+            self.assertEqual((config / "kitty" / "kitty.conf").read_text(), before_config)
+            self.assertEqual(
+                state.read_text(),
+                before_state,
+                "a frozen module must not have its ledger rewritten — that would erase drift",
+            )
+
+    def test_install_restores_defaults_when_the_preset_and_target_are_both_gone(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            config = env.home / ".config"
+            state = env.home / ".local" / "state" / "noctalia-mod" / "modules" / "kitty.state"
+            self._run(env, fake_bin, "install", "kitty", "--yes")
+            with (config / "kitty" / "kitty.conf").open("a", encoding="utf-8") as handle:
+                handle.write("\n# mine\n")
+            self._run(env, fake_bin, "preset", "kitty", "save", "mine", "--yes")
+            self._run(env, fake_bin, "preset", "kitty", "apply", "mine", "--yes")
+            self._run(env, fake_bin, "preset", "kitty", "delete", "mine")
+            shutil.rmtree(config / "kitty")
+
+            installed = self._run(env, fake_bin, "install", "kitty", "--yes")
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            self.assertNotIn("# mine", (config / "kitty" / "kitty.conf").read_text())
+            recorded = dict(line.split("\t", 1) for line in state.read_text().splitlines())
+            self.assertEqual(recorded["preset"], "default")
 
     def test_setup_defaults_to_the_core_set_and_summarises(self) -> None:
         """PLAN §11 B: setup is the guided path from zero to a desktop, core set only."""

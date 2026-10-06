@@ -21,6 +21,8 @@ source "$NOCTALIA_MOD_ROOT/lib/module-loader.sh"
 source "$NOCTALIA_MOD_ROOT/lib/package-manager.sh"
 # shellcheck source=../lib/deploy.sh
 source "$NOCTALIA_MOD_ROOT/lib/deploy.sh"
+# shellcheck source=../lib/preset.sh
+source "$NOCTALIA_MOD_ROOT/lib/preset.sh"
 # shellcheck source=../lib/snapshot.sh
 source "$NOCTALIA_MOD_ROOT/lib/snapshot.sh"
 # shellcheck source=../lib/reference-check.sh
@@ -35,7 +37,8 @@ Usage:
   noctalia-mod deps [module ...] [--yes]
   noctalia-mod plan [module ...]
   noctalia-mod install [module ...] [--yes]
-  noctalia-mod preset <module> list|apply <name> [--yes]
+  noctalia-mod preset <module> list
+  noctalia-mod preset <module> apply|save|edit|delete <name> [--yes]
   noctalia-mod part <module> <slot> list|apply <name> [--yes]
   noctalia-mod snapshot [note]
   noctalia-mod snapshot list|delete <id>
@@ -129,6 +132,14 @@ print_module_lines() {
         done
         [[ -e $target || -L $target ]] && printf 'overwrite\t%s\t%s\n' "$id" "$target"
         ((${#MODULE_RELOAD_COMMAND[@]})) && printf 'reload\t%s\t%s\n' "$id" "$(join_by ' ' "${MODULE_RELOAD_COMMAND[@]}")"
+        # 账本里的 preset 没了：这次要么冻结它、要么回退默认。预检里说出来，
+        # 否则用户只看到 "installed: niri" 却不知道它根本没被碰过（PLAN §4）。
+        local stored_preset deploy_mode
+        stored_preset=$(module_state_get "$id" preset 2>/dev/null || true)
+        if [[ -n $stored_preset ]]; then
+            deploy_mode=$(preset_deploy_mode "$id")
+            [[ $deploy_mode == ok ]] || printf 'preset-missing\t%s\t%s\t%s\n' "$id" "$stored_preset" "$deploy_mode"
+        fi
         # 漂移：目标被本项目之外的东西改过（PLAN §1）。指纹只覆盖会覆盖的文件。
         recorded_fingerprint=$(module_state_get "$id" fingerprint 2>/dev/null || true)
         if [[ -n $recorded_fingerprint ]]; then
@@ -288,6 +299,9 @@ record_modules() {
     local id target custom_paths preserve_paths part selected
     local -a part_pairs=()
     for id in "$@"; do
+        # 被冻结的模块这次一个字节都没动：重算指纹会把漂移一起抹掉，等于替用户
+        # 宣布"没变化"。账本留给上一次真正部署它的那回。
+        contains_word "$id" "${MODULE_DEPLOY_FROZEN[@]}" && continue
         module_load "$id"
         target=$(safe_target_path "$MODULE_TARGET")
         custom_paths=$(find "$target" -name '*__custom__*' -printf '%P,' 2>/dev/null | sed 's/,$//' || true)
@@ -430,7 +444,14 @@ cmd_install() {
     done
     record_modules "$snapshot" "${modules[@]}"
     state_append_audit install "$(join_by ',' "${modules[@]}")"
-    log "installed: $(join_by ', ' "${modules[@]}")"
+    # 冻结的模块这次一个字节都没动，不能算进"已安装"里。
+    local -a deployed=()
+    for id in "${modules[@]}"; do
+        contains_word "$id" "${MODULE_DEPLOY_FROZEN[@]}" || deployed+=("$id")
+    done
+    ((${#MODULE_DEPLOY_FROZEN[@]})) && warn "left as is (preset missing): $(join_by ', ' "${MODULE_DEPLOY_FROZEN[@]}")"
+    ((${#deployed[@]})) && log "installed: $(join_by ', ' "${deployed[@]}")"
+    return 0
 }
 
 # 初始化核心集：配置能真正跑起来的最小集合（PLAN §11 阶段 B）。niri 的默认配置
@@ -454,7 +475,11 @@ print_setup_summary() {
     for id in "${modules[@]}"; do
         module_load "$id"
         target=$(safe_target_path "$MODULE_TARGET")
-        printf 'deployed\t%s\t%s\n' "$id" "$target"
+        if contains_word "$id" "${MODULE_DEPLOY_FROZEN[@]}"; then
+            printf 'frozen\t%s\t%s\n' "$id" "$(module_state_get "$id" preset 2>/dev/null || true)"
+        else
+            printf 'deployed\t%s\t%s\n' "$id" "$target"
+        fi
     done
     printf 'next\tstart a niri session, or reload one already running, to pick it up\n'
     printf 'undo\tnoctalia-mod rollback\n'
@@ -525,14 +550,18 @@ cmd_preset() {
     case $action in
         list)
             [[ $# -eq 2 ]] || { error 'preset list does not accept extra arguments'; return 2; }
-            module_load "$id"
-            printf 'default\n'
-            if [[ -d $(module_root "$id")/presets ]]; then
-                find "$(module_root "$id")/presets" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
-            fi
+            module_load "$id" || return 1
+            printf 'preset\tsource\tactive\n'
+            preset_catalog "$id"
             ;;
-        apply)
-            [[ -n $name ]] || { error 'preset apply requires a preset name'; return 2; }
+        apply|save|edit|delete)
+            [[ -n $name ]] || { error "preset $action requires a preset name"; return 2; }
+            # `apply default` 是正经操作——它就是把模块铺回随仓库发布的默认配置。
+            # 反过来，default 不是一个能存/改/删的名字。
+            if [[ $action != apply ]] && preset_is_reserved "$name"; then
+                error "default is reserved: it means the shipped configuration, not a preset"
+                return 1
+            fi
             shift 3
             for option in "$@"; do
                 if [[ $option == --yes || $option == --express ]]; then
@@ -542,25 +571,51 @@ cmd_preset() {
                     return 2
                 fi
             done
-            module_load "$id"
-            module_source_for_preset "$(module_root "$id")" "$name" >/dev/null || { error "unknown preset: $name"; return 1; }
-            local old_preset preset_was_set=no
-            old_preset=$(module_state_get "$id" preset 2>/dev/null || true)
-            [[ -n $old_preset ]] && preset_was_set=yes
-            state_module_set "$id" preset "$name"
-            if [[ $yes == yes ]]; then
-                cmd_install "$id" --yes || install_rc=$?
-            else
-                cmd_install "$id" || install_rc=$?
-            fi
-            if [[ ${install_rc:-0} -ne 0 ]]; then
-                if [[ $preset_was_set == yes ]]; then
-                    state_module_set "$id" preset "$old_preset"
-                else
-                    state_module_unset "$id" preset
-                fi
-                return 1
-            fi
+            module_load "$id" || return 1
+            case $action in
+                apply)
+                    module_source_for_preset "$(module_root "$id")" "$name" >/dev/null || { error "unknown preset: $name"; return 1; }
+                    local old_preset preset_was_set=no
+                    old_preset=$(module_state_get "$id" preset 2>/dev/null || true)
+                    [[ -n $old_preset ]] && preset_was_set=yes
+                    state_module_set "$id" preset "$name"
+                    if [[ $yes == yes ]]; then
+                        cmd_install "$id" --yes || install_rc=$?
+                    else
+                        cmd_install "$id" || install_rc=$?
+                    fi
+                    if [[ ${install_rc:-0} -ne 0 ]]; then
+                        if [[ $preset_was_set == yes ]]; then
+                            state_module_set "$id" preset "$old_preset"
+                        else
+                            state_module_unset "$id" preset
+                        fi
+                        return 1
+                    fi
+                    ;;
+                save)
+                    # 覆盖一份用户自己写的预设是不可逆的，所以要问一次；官方名字由
+                    # preset_save 拒绝，不给"永远不生效的同名目录"留活路。
+                    if [[ $(preset_source_of "$id" "$name") == user ]]; then
+                        confirm_plan "$yes" "Overwrite user preset $name of $id?" || return 1
+                    fi
+                    preset_save "$id" "$name" || return 1
+                    state_append_audit preset-save "$id/$name"
+                    log "preset saved: $id/$name"
+                    ;;
+                edit)
+                    preset_edit "$id" "$name" || return 1
+                    log "edit saved: apply it with: noctalia-mod preset $id apply $name"
+                    ;;
+                delete)
+                    # 删掉正在用的那份：之后这个模块会冻结，直到换一个预设或重铺默认。
+                    [[ $(module_state_get "$id" preset 2>/dev/null || true) == "$name" ]] && \
+                        warn "preset $name is active for $id; it will be frozen until you apply another one"
+                    preset_delete "$id" "$name" || return 1
+                    state_append_audit preset-delete "$id/$name"
+                    log "preset deleted: $id/$name"
+                    ;;
+            esac
             ;;
         *) error "unknown preset action: $action"; return 2 ;;
     esac

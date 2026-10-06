@@ -200,8 +200,13 @@ module_reload() {
     "${MODULE_RELOAD_COMMAND[@]}"
 }
 
+# 这次没被部署的模块（账本里的 preset 没了、目标被冻结）。CLI 的 record_modules
+# 靠它跳过这些模块：重算指纹会把漂移一起抹掉，那等于替用户宣布"没变化"。
+MODULE_DEPLOY_FROZEN=()
+
 module_deploy() {
     local id=$1 part_slot=${2-} root target preset source_or_stage staged='' part_target=''
+    local mode reset_preset=no
     local -a preserve_paths=()
     module_load "$id" || return 1
     root=$(module_root "$id")
@@ -220,6 +225,19 @@ module_deploy() {
     done
     preset=$(module_state_get "$id" preset 2>/dev/null || true)
     [[ -n $preset ]] || preset=$MODULE_PRESET_DEFAULT
+    # 账本里的 preset 没了（用户删了 / 上游移除）。目标还在就冻结它，绝不静默把
+    # 用户的配置改回默认；目标也没了才回退 default——那是唯一没有东西可丢的情形。
+    mode=$(preset_deploy_mode "$id")
+    if [[ $mode == frozen ]]; then
+        warn "module $id: preset '$preset' no longer exists; keeping $target as is"
+        MODULE_DEPLOY_FROZEN+=("$id")
+        return 0
+    fi
+    if [[ $mode == reset ]]; then
+        warn "module $id: preset '$preset' no longer exists and $target is missing; reinstalling defaults"
+        preset=$MODULE_PRESET_DEFAULT
+        reset_preset=yes
+    fi
     source_or_stage=$(build_module_stage "$id" "$root" "$preset" "$target") || return 1
 
     if [[ -f $source_or_stage || -L $source_or_stage ]]; then
@@ -233,6 +251,9 @@ module_deploy() {
     apply_chmod_rules "$target" || return 1
     module_validate_deployment "$target" || return 1
     module_reload || return 1
+    # 部署成功之后才记这个回退，失败就什么都不留（部署在前、写状态在后）。
+    [[ $reset_preset == yes ]] && state_module_set "$id" preset "$preset"
+    return 0
 }
 
 module_clear_managed_config() {

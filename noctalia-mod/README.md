@@ -52,6 +52,7 @@ Everything else:
 noctalia-mod/bin/noctalia-mod list
 noctalia-mod/bin/noctalia-mod check
 noctalia-mod/bin/noctalia-mod plan niri noctalia
+noctalia-mod/bin/noctalia-mod preset kitty list
 noctalia-mod/bin/noctalia-mod preset kitty apply transparent --yes
 noctalia-mod/bin/noctalia-mod part niri glow apply glow --yes
 noctalia-mod/bin/noctalia-mod snapshot "before edit"
@@ -60,9 +61,40 @@ noctalia-mod/bin/noctalia-mod status
 noctalia-mod/bin/noctalia-mod uninstall niri --yes
 ```
 
-Five modules are wired up so far: `niri`, `noctalia`, `kitty`, `fish`, and
-`starship`. Module metadata lives in `modules/<id>/module.conf`; default files,
-presets, and parts stay inside that module directory.
+Eight modules are wired up: `niri`, `noctalia`, `kitty`, `fish`, `starship`,
+`fastfetch`, `xdg-desktop-portal`, and `zed`. Module metadata lives in
+`modules/<id>/module.conf`; default files, presets, and parts stay inside that
+module directory.
+
+## Presets
+
+Four layers stack, lowest to highest: the shipped default configuration, official
+presets in the repo, your own presets, and `__custom__` files in the target.
+
+```bash
+noctalia-mod/bin/noctalia-mod preset kitty list                  # name, source, active
+noctalia-mod/bin/noctalia-mod preset kitty apply transparent --yes
+noctalia-mod/bin/noctalia-mod preset kitty save mine --yes        # snapshot what you have now
+noctalia-mod/bin/noctalia-mod preset kitty edit mine              # $EDITOR on the preset
+noctalia-mod/bin/noctalia-mod preset kitty delete mine
+noctalia-mod/bin/noctalia-mod preset kitty apply default --yes    # back to the shipped config
+```
+
+Your presets live in `~/.config/noctalia-mod/presets/<module>/<name>/` — config
+rather than state, because they are files you wrote and may want to back up. When
+a name exists in both places the official preset wins; `save` refuses to shadow
+one. `default` is reserved: `apply default` is the reset, and `save`, `edit` and
+`delete` reject the name. `save` copies the current target minus `__custom__`
+entries (those are your live overrides and are re-inherited on every deploy),
+keeps runtime symlinks as links, and asks before overwriting an existing preset.
+
+If the active preset disappears — you deleted it, or upstream renamed it — a
+deploy will not guess. The module is **frozen**: the target is left exactly as it
+is and the ledger is not rewritten, because falling back to defaults would throw
+away your configuration and recomputing the fingerprint would hide the drift.
+`plan` and `setup` print `preset-missing <module> <preset> frozen` for it. Only
+when the target is gone too does a deploy fall back to `default`, since there is
+nothing left to lose.
 
 ## Reference check
 
