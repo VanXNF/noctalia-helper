@@ -8,9 +8,9 @@
 > 一并作废（见 §12）。
 >
 > **新会话先读 [§16 接手须知](#16-接手须知新会话先读)**
-> —— 环境事实、当前工作区状态、下一步、待裁决清单、已知陷阱、
-> 以及哪些结论只是推理而非实测，都在那一节。阶段 A 与阶段 B 已收口，
-> 下一步是阶段 C。
+> —— 环境事实、工作区与 Git 状态、下一步、待裁决清单、已知陷阱、
+> 以及哪些结论只是推理而非实测，都在那一节。阶段 A–D 已收口，
+> 下一步是阶段 E。
 
 ## 0. 终极目标与定位
 
@@ -1057,16 +1057,20 @@ HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod install niri noctalia --yes
 HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod snapshot
 HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod rollback
 HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod uninstall niri noctalia --yes
+HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod theme status
+HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod wallpapers status
 ```
 
-注意这些命令需要 PATH 上能有 `pacman`、`sudo` 之类；本机实测时用假命令目录放在
-PATH 前面（见 §16.5 的做法），否则 `setup --yes` 会真的去装包。
+注意这些命令需要 PATH 上能有 `pacman`、`sudo`、`xdg-user-dir`、`gsettings` 之类；
+本机实测时用假命令目录放在 PATH 前面（见 §16.5 的做法），否则 `setup --yes` 会真的去
+装包、`theme sync` 会真的动你当前的 gsettings。`theme sync` 与 `wallpapers deploy`
+是两条**会改到 `~/.config` 之外**的命令，在真机上跑之前先想清楚。
 
 ## 14. 会话执行约束
 
 1. 先读 **§16 接手须知**（环境事实、工作区状态、陷阱、待裁决），再读对应模块
    README，然后动手。
-2. 修改前检查 `git status`（当前工作区是脏的，见 §16.3）。
+2. 修改前检查 `git status` 与 §16.3 的工作区状态；有未提交改动先问用户，别在脏树上动工。
 3. 对路径、状态、部署、保留规则有疑问时，全仓库检索引用后再下结论。
 4. 每步保持新旧引擎可并行运行，不修改旧 `install.sh`（阶段 G 之前）。
 5. 每个模块独立测试，不依赖其他模块的隐式副作用。
@@ -1107,6 +1111,10 @@ PATH 前面（见 §16.5 的做法），否则 `setup --yes` 会真的去装包�
 | 网络 | 通（GitHub 与 Arch 镜像均可达） |
 | `shellcheck` | `~/.local/bin/shellcheck`，v0.11.0 官方静态二进制；`~/.local/bin` 在默认 PATH 上 |
 | `fish` | 4.9.3，在 PATH 上（fish 模块本来就要装它），所以 `fish -n` 能进语法门禁 |
+| `xdg-user-dir` / `timeout` / `gsettings` | 都在 PATH 上。前两个被 `@XDG_PICTURES@` 与各处的超时用到，`gsettings` 被 `theme sync` 用到 |
+| Git 身份 | `victor xu <vanxnf@gmail.com>`（全局已配好；此前几个提交的身份是后改的，见 §16.3） |
+| 远端 | `git@github.com:VanXNF/noctalia-helper.git`，当前分支 `refactor/v3` |
+| **SSH 是坏的** | `/etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf` 的符号链接目标属主成了 `nobody:nobody`，OpenSSH 的属主检查直接拒绝读配置，任何 ssh 连接都起不来。绕法：`GIT_SSH_COMMAND='ssh -F /dev/null -o ConnectTimeout=15 -o BatchMode=yes' git push …`。**没有**改那个系统文件（属于系统，不是本仓库的事） |
 | 沙箱 | 工作区之外只读；写 `~/.local/bin` 之类需要一次提权 |
 
 `shellcheck` 是后补装的（pacman 不可用，走官方 tar.xz 静态二进制），子项目、
@@ -1138,15 +1146,26 @@ noctalia-mod/bin/noctalia-mod check
 零告警、64 个测试 OK、`check` 全绿。
 仓库根 `discover -s tests` 也能过，但**不再覆盖子项目**（测试已迁入，见 §13）。
 
-### 16.3 当前工作区状态
+### 16.3 当前工作区与 Git 状态
 
-- 所有改动**均未提交**。用户明确要求不主动 commit。
-- `git status` 会显示 `RM tests/test_noctalia_mod.py -> noctalia-mod/tests/test_noctalia_mod.py`
-  —— 重命名由 `git mv` 完成，因此**已暂存**，其余改动未暂存。这不是异常。
-- 未跟踪的新文件：`lib/reference-check.sh`、`tests/utils.py`、
-  `modules/niri/files/effects.kdl`（软链）、`modules/noctalia/files/{mpv-hook.lua,
-  wallpaper-hook.sh,tools/}`。
-- 仓库根 `CHANGELOG.md` 的 `noctalia-mod` 条目已被移除，理由见 §12。
+- 工作区**干净**，改动都已提交。分支 `refactor/v3`，远端 tip 是 `0634edc`。
+- **两个提交还没推上去**（`git log --oneline origin/refactor/v3..HEAD`）：
+  - `59b0779` 运行时能力：补齐 XDG 路径改写、GTK 深浅同步与壁纸部署（阶段 D）
+  - `c374dc7` 迁入剩余三个模块并补上用户预设（阶段 C）
+  要推的话记得 §16.1 那条 SSH 绕法。
+- 更早的三个提交（`0634edc` 建基座+setup、`8f59962` 首阶段、`2214f27` 方案文档）
+  已经推上去了。其中两个原本用旧身份 `Echoes678 <raydu678@gmail.com>` 提交，后来
+  按用户要求重写成 `victor xu <vanxnf@gmail.com>` 并 force-push——**任何拉过
+  `refactor/v3` 的地方都要 `git fetch --force` 后 reset**，否则会看到分叉。
+- **旧引擎仍然是活入口**：`install.sh` 走 `python3 -I -S -c … nyxuri.cli`，仓库根的
+  `nyxuri/`、`configs/`、`assets/` 都还在服役。子项目**没有**接进入口（那是阶段 G），
+  所以：
+  - 不要为了让子项目好过而改 `nyxuri/`、`configs/`、`assets/`（阶段 G 之前不动）；
+  - 子项目里那份 `assets/wallpapers/lawson_fuji.webp` 与仓库根那份暂时是重复的，
+    旧树退役时一起消失（§12）；
+  - 仓库根 `CHANGELOG.md` 里子项目的条目已经撤掉，理由见 §12。
+- 仓库根 `discover -s tests`（旧引擎 471 个用例）现在是绿的；子项目的测试**不在**
+  那条发现路径里，要单独跑（见 §16.2）。
 
 ### 16.4 已知陷阱（都踩过）
 
@@ -1161,24 +1180,51 @@ noctalia-mod/bin/noctalia-mod check
 5. **`state_root()` 会自加 `noctalia-mod`**：lib 级测试里设置 `XDG_STATE_HOME`
    时要给它的父目录，否则 prune 之类会跑在空目录上、测试变成假通过。
 6. **仓库根 `AGENTS.md` §3 的 `bash -n install.sh configs/.../*.sh` 是同一个坑**
-   （只检查了 `install.sh`）。**没有擅自改动该文件**，等用户裁决。
+   （只检查了 `install.sh`）。**没有擅自改动那一行**，等用户裁决（AGENTS §4 的占位符
+   那行倒是按阶段 D 的决定加了 `@XDG_PICTURES@`）。
+7. **注释里不要写占位符字面量**：`/home/user` 与 `@XDG_PICTURES@` 是全局文本替换，
+   注释里写了会连注释一起被替换成一句读不通的话（真踩过，`noctalia-config.toml`
+   里那条说明现在刻意不写占位符本身）。
+8. **删掉测试替身 ≠ 测回退**：PATH 后面还压着真的命令。想测"`xdg-user-dir` 答不出来
+   就回退"，得让替身 `exit 1`，而不是把替身删掉——真 `xdg-user-dir` 在没有
+   `user-dirs.dirs` 时会按 XDG 规定答 `$HOME`，于是断言会以看上去毫不相干的方式失败。
+9. **`compileall` 会把 `__pycache__` 写进 `files/`，然后被一起部署进 `~/.config`**。
+   跑随包 Python 的语法门禁必须带 `PYTHONPYCACHEPREFIX`（见 §16.2 第一条命令），
+   跑完顺手确认 `find noctalia-mod/modules -name __pycache__` 是空的。
+10. **`find … -type d` 不跟软链**：预设/目录清单用的是它，所以软链目录既不会被列出
+   也不会被解析（这是想要的行为，见 §4"预设目录本身不接受软链"）。
+11. **`((${#arr[@]})) && printf …` 作函数最后一句会返回 1**，`set -e` 下把调用方带崩。
+   本项目里所有"打印行"的小函数都在末尾补 `return 0`，新加同类函数照做。
 
 ### 16.5 哪些是实测，哪些还只是推理
 
 写结论前先看这张表，别把推理当既成事实。
 
-**实测过**（阶段 D 新增的一批都直接在实机文件上验过）：新项目部署出的壁纸路径是
-`$HOME/图片/Wallpapers` 而本机 `xdg-user-dir PICTURES` = `~/Pictures`、`~/图片` 不存在
-（§10 P1-7）；模式已是 `light` 但 `gsettings gtk-theme` 与 `gtk-3.0/settings.ini` 仍是
-dark（§10 P1-8）；Noctalia 会删掉 `kitty.conf` 的 `BEGIN_KITTY_THEME` 块并把调色板写进
-`kitty.conf` / `themes/noctalia.conf` / `starship.toml`（§10 P1-9，逐文件 `diff` 过）；
-旧引擎部署出的 `directory` 是 `/home/victorxu/Pictures/Wallpapers`（证明旧引擎的改写
-确实在跑）。**仍然是**：门禁三连、64 个测试、`check` 全绿、`deps → install → plan → uninstall`
-在假命令 + 临时 HOME 下闭环、`setup --yes` 从零到配置就位并幂等复跑（树不变、无
-暂存残留、账本不重复）、`setup --with` 的 argv 形状与未声明名字被拒、`plan niri` /
-`deps niri` 不再报别的模块的程序、drift 的四种情形（受管改动报、`__custom__`/preserve/
-运行时软链不报、重部署清零、目标消失报 missing）、P0-1 的端到端复现、AUR helper
-前置确认的顺序契约、并发锁拒绝、以 `command -v` 为准的运行时程序核对（本机实测：必需程序全部就位，可选只缺 `ddcutil`）。
+**实测过**：
+
+- 门禁三连（含随包 Python 与 fish 的语法）、64 个测试、`check` 全绿。
+- 旧引擎的 471 个用例仍绿（`discover -s tests`）。
+- `deps → install → plan → snapshot → rollback → uninstall` 在假命令 + 临时 HOME 下闭环。
+- `setup --yes` 从零到配置就位并幂等复跑（树不变、无暂存残留、账本不重复）；
+  `setup --with` 的 argv 形状与未声明名字被拒。
+- `plan niri` / `deps niri` 不再报别的模块的程序（§10 收口）。
+- drift 的四种情形（受管改动报、`__custom__` / preserve / 运行时软链不报、重部署清零、
+  目标消失报 missing）；新增：声明成 `MODULE_RUNTIME_WRITES` 的文件改写后不报漂移，
+  且下一次部署仍会把它覆盖回仓库版本。
+- 用户预设全路径：save 不带 `__custom__`、软链按链接存、保留字/官方同名/非法名被拒、
+  覆盖前确认、delete/edit 只动用户预设、单文件目标往返、活跃预设消失后的冻结与回退。
+- **阶段 D 的三处缺口都在实机文件上验过**：新项目部署出的壁纸路径是
+  `$HOME/图片/Wallpapers`，而本机 `xdg-user-dir PICTURES` = `~/Pictures`、`~/图片`
+  不存在（§10 P1-7）；模式已是 `light` 但 `gsettings gtk-theme` 与
+  `gtk-3.0/settings.ini` 仍是 dark（§10 P1-8）；Noctalia 会删掉 `kitty.conf` 的
+  `BEGIN_KITTY_THEME` 块并把调色板写进 `kitty.conf` / `themes/noctalia.conf` /
+  `starship.toml`（§10 P1-9，逐文件 `diff` 过）；旧引擎部署出的 `directory` 是
+  `/home/victorxu/Pictures/Wallpapers`（证明旧引擎的改写确实在跑）。
+- 修好之后的行为也验过：隔离 HOME 里 `@XDG_PICTURES@` 跟着假的 `xdg-user-dir` 走、
+  `theme sync` 写出的两键与 `gsettings` 调用正确、壁纸 no-clobber 幂等、
+  `wallpapers remove` 只删账本条目、手写的越界账本条目被拒且 `/etc/passwd` 完好。
+- P0-1 的端到端复现、AUR helper 前置确认的顺序契约、并发锁拒绝、以 `command -v`
+  为准的运行时程序核对（本机实测：必需程序全部就位，可选只缺 `ddcutil`）。
 
 **未实测（只有推理或设计）**：
 
@@ -1188,15 +1234,23 @@ dark（§10 P1-8）；Noctalia 会删掉 `kitty.conf` 的 `BEGIN_KITTY_THEME` �
 - **Noctalia v5.2.1 是否真会在目录缺失时静默空面板**：依据是官方文档 + 上游源码 +
   本机二进制字符串，**没有在真机 niri 会话里实跑**（调研是只读约束）。这条支撑着
   §10 P1-7 的后果判断。
-- 三处 Noctalia 反向改写**会让新项目报漂移**：改写本身已实测，但"指纹会因此报警"是从
-  既有 drift 契约推出来的（`test_drift_reports_only_files_the_project_would_overwrite`
-  锁的就是"受管文件被外部改动即报 changed"），**没有在实机上跑过 `plan kitty`**——本机
-  的新项目从未部署过、状态目录里没有指纹记录；要跑就得先 `install`，那会覆盖作者真实
-  的 `~/.config`。
+- **"哪些文件会被 Noctalia 就地改写"是逐文件 diff 出来的，不是 Noctalia 的契约**：本机
+  确认了 `kitty.conf` / `kitty/themes/noctalia.conf` / `starship.toml` 三处，并据此写了
+  `MODULE_RUNTIME_WRITES`。Noctalia 升级后若多写一个文件，`plan` 会重新报漂移——那正是
+  §1 想要的信号，但别把这三条声明当成永久契约。另外**没有在实机上跑过 `plan kitty`**
+  （本机的新项目从未部署过、状态目录里没有指纹记录；要跑就得先 `install`，那会覆盖作者
+  真实的 `~/.config`），"声明了就不报"只在隔离 HOME 的测试里验过。
 - 在 niri 会话之外（TTY）跑 `setup` 会怎样：按现有契约，`niri msg action
   reload-config` 失败会导致部署回滚。这是从代码推出的结论，未在 TTY 上实测。
 - niri 是否真的会因为缺 `effects.kdl` 而拒绝加载配置：未验证。修复是防御性的
   （随包提供软链），无害但理由未经实机确认。
+- **`theme sync` 在真实 Noctalia 会话里的效果**：只验到"它写对了
+  `settings.ini` 与 `gsettings`"，没验"GTK 应用真的跟着变了深浅"，也没验模式切换后
+  Noctalia 自己会不会顺手把 `color-scheme` 之外的东西也改掉。
+- **`@XDG_PICTURES@` 在真实用户目录下的取值**：隔离测试用的是假 `xdg-user-dir`；
+  本机真实值是 `~/Pictures`，但中文 locale 机器、或 `user-dirs.dirs` 缺失（真
+  `xdg-user-dir` 会答 `$HOME`）这两种形态都没在真机上跑过部署。
+- 壁纸的实际观感（Noctalia 面板能不能看到离线那张）没验：那要在真会话里点开面板。
 - §3 的程序层声明（`MODULE_REQUIRED_COMMANDS` 等）是逐脚本人工审计的结果，
   不是自动推导出来的。
 - shipped 工具的 `import` 与 `MODULE_REPO_PACKAGES` 是否一致，没有自动校验
@@ -1204,19 +1258,27 @@ dark（§10 P1-8）；Noctalia 会删掉 `kitty.conf` 的 `BEGIN_KITTY_THEME` �
 
 ### 16.6 下一步与待裁决
 
-阶段 A（基座收口）、B（全新系统初始化闭环的代码部分）、C（内容侧补齐）与
-D（运行时能力）**已完成**，见 §11。下一步是**阶段 E：运维与自更新**——`update`、
-`doctor` 体检与 `bug` 诊断导出、`clean` 缓存清理、沙箱部署测试入口，以及把
-快照/回滚做成事务。
+**阶段 A（基座收口）、B（全新系统初始化闭环的代码部分）、C（内容侧补齐）、
+D（运行时能力）都已完成**，逐阶段的交付与理由见 §11。下一步是
+**阶段 E：运维与自更新**：
 
-阶段 B/C/D 已拍板的都记在 §11 对应阶段里，别再翻案；其中阶段 D 的四项（占位符修法、
-主题同步触发时机、运行时写入的建模、壁纸范围）在 §11 阶段 D 与 §10 P1-7…P1-9 有完整
-说明与理由。
+- `update`：拉取新版本 + 重新部署（新旧引擎共存期先不做自动状态迁移）。
+- `doctor` 体检与 `bug` 诊断导出（旧引擎那套在 `nyxuri/doctor.py`，可以对着抄检查项，
+  但不要照抄它的单文件结构）。
+- `clean` 缓存清理（`-n` 预览）。
+- 沙箱部署测试入口（等价 `install.sh test`）。
+- 快照/回滚做成事务（§10 P2 最后一条）。
 
-仍然开着的两项（都要你定，我不动）：
+已拍板的决定散在 §11 各阶段末尾，**别再翻案**；阶段 D 的四项（占位符修法、主题同步
+触发时机、运行时写入的建模、壁纸范围）连同实测证据在 §10 P1-7…P1-9 有完整说明。
 
-1. 仓库根 `AGENTS.md` §3 的 `bash -n install.sh configs/.../*.sh` 是同一个坑（只检查了
-   `install.sh`）。要不要一并修掉？见 §16.4 陷阱一。
-2. 真实机器上的初始化验收什么时候做、在什么环境下做？容器里 `sudo` 不可用（§16.1），
-   所以"全新系统能进桌面、快捷键可用、Noctalia 正常渲染"至今仍是推理。阶段 E 的
-   沙箱部署测试入口解决不了这一条——它不装真包、不进真会话。
+仍然开着的两项，都要用户拍板，不要自己动：
+
+1. 仓库根 `AGENTS.md` §3 的 `bash -n install.sh configs/.../*.sh` 多文件写法（只检查了
+   第一个文件）。要不要一并修掉？见 §16.4 陷阱一。
+2. **真实机器上的初始化验收**什么时候做、在什么环境下做？容器里 `sudo` 不可用
+   （§16.1），所以"全新系统能进桌面、快捷键可用、Noctalia 正常渲染"至今仍是推理。
+   阶段 E 的沙箱部署测试入口解决不了这一条——它不装真包、不进真会话。
+
+开工前的固定动作：`git status` 看树、按 §16.2 跑门禁三连建基线、读本节的
+§16.1–§16.5，然后才动手。
