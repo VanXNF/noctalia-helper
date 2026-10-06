@@ -1666,6 +1666,388 @@ printf '\\n' >> \"$FAKE_LOG\"
                 "runtime-written is about the fingerprint only — the module still owns the file",
             )
 
+    # ---- 阶段 E：运维与自更新 ----
+
+    def _git(self, *args: str, cwd: Path) -> str:
+        """Hermetic git fixture: no host config, a fixed identity, fail loud."""
+        result = subprocess.run(
+            [
+                "git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                *args,
+            ],
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=False,
+            env={
+                **os.environ,
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_SYSTEM": os.devnull,
+            },
+        )
+        self.assertEqual(result.returncode, 0, f"git {' '.join(args)}: {result.stderr}")
+        return result.stdout
+
+    def test_doctor_reports_the_ledger_and_fails_on_a_missing_target(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            installed = self._run(env, fake_bin, "install", "niri", "--yes")
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+
+            healthy = self._run(env, fake_bin, "doctor")
+            self.assertEqual(healthy.returncode, 0, healthy.stderr)
+            self.assertIn("ok\trepository\t", healthy.stdout)
+            self.assertIn(f"ok\tmodules\tniri: {env.home / '.config' / 'niri'}", healthy.stdout)
+            self.assertIn("summary\t", healthy.stdout)
+
+            shutil.rmtree(env.home / ".config" / "niri")
+            broken = self._run(env, fake_bin, "doctor")
+            self.assertEqual(broken.returncode, 1, broken.stdout)
+            self.assertIn("fail\tmodules\tniri: target", broken.stdout)
+
+    def test_doctor_surfaces_drift_and_staging_residue(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            self._run(env, fake_bin, "install", "niri", "--yes")
+            config = env.home / ".config"
+            with (config / "niri" / "animations.kdl").open("a", encoding="utf-8") as handle:
+                handle.write("// edited by hand\n")
+            residue = config / ".niri.noctalia-mod.build.abc123"
+            residue.mkdir()
+            (residue / "partial").write_text("half staged\n")
+
+            report = self._run(env, fake_bin, "doctor")
+            self.assertEqual(report.returncode, 0, report.stderr)
+            self.assertIn("warn\tmodules\tniri: managed files changed", report.stdout)
+            self.assertIn("warn\tstate\t1 leftover staging path(s)", report.stdout)
+
+    def test_bug_report_collects_ledger_packages_and_doctor_output(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            self._run(env, fake_bin, "install", "niri", "--yes")
+
+            exported = self._run(env, fake_bin, "bug")
+            self.assertEqual(exported.returncode, 0, exported.stderr)
+            path = Path(exported.stdout.strip().split(": ", 1)[1])
+            self.assertTrue(path.is_file(), exported.stdout)
+            report = path.read_text(encoding="utf-8")
+            self.assertIn("# Noctalia Mod diagnostic report", report)
+            self.assertIn(f"niri\tdefault\t{env.home / '.config' / 'niri'}", report)
+            # 假 pacman 一律答"没装"，所以依赖阶段真的装过，账本里该有它。
+            self.assertIn("niri\trepo", report)
+            self.assertIn("## Doctor", report)
+
+    def test_clean_removes_only_our_staging_residue(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            config = env.home / ".config"
+            (config / "niri").mkdir(parents=True)
+            (config / "niri" / "user.kdl").write_text("mine\n")
+            build = config / ".niri.noctalia-mod.build.abc123"
+            build.mkdir()
+            (build / "partial").write_text("half staged\n")
+            single = config / ".starship.toml.noctalia-mod.new.abcdef"
+            single.write_text("half staged\n")
+            unrelated = config / "notes.noctalia-mod.other.abc123"
+            unrelated.mkdir()
+
+            preview = self._run(env, fake_bin, "clean", "-n")
+            self.assertEqual(preview.returncode, 0, preview.stderr)
+            self.assertIn(f"staging\twould remove\t{build}", preview.stdout)
+            self.assertIn(f"staging\twould remove\t{single}", preview.stdout)
+            self.assertTrue(build.is_dir(), "a dry run must not delete anything")
+
+            swept = self._run(env, fake_bin, "clean")
+            self.assertEqual(swept.returncode, 0, swept.stderr)
+            self.assertFalse(build.exists())
+            self.assertFalse(single.exists())
+            self.assertTrue(unrelated.is_dir(), "a name that only looks similar is not ours")
+            self.assertEqual((config / "niri" / "user.kdl").read_text(), "mine\n")
+
+            again = self._run(env, fake_bin, "clean")
+            self.assertIn("staging\tnothing to remove", again.stdout)
+
+    def test_clean_prunes_snapshots_only_when_asked_and_previews_them(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            snapshots = env.home / ".local" / "state" / "noctalia-mod" / "snapshots"
+            for index in range(32):
+                directory = snapshots / f"snapshot_20260101_000000_{index:06d}"
+                directory.mkdir(parents=True)
+                (directory / "meta.tsv").write_text(
+                    f"created_at\t2026-01-01T00:00:{index:02d}Z\nkind\tmanual\nnote\t\n",
+                    encoding="utf-8",
+                )
+
+            untouched = self._run(env, fake_bin, "clean")
+            self.assertEqual(untouched.returncode, 0, untouched.stderr)
+            self.assertNotIn("snapshot\t", untouched.stdout)
+            self.assertEqual(len(list(snapshots.iterdir())), 32)
+
+            preview = self._run(env, fake_bin, "clean", "-n", "--snapshots")
+            self.assertEqual(preview.returncode, 0, preview.stderr)
+            self.assertIn(
+                "snapshot\twould remove\tsnapshot_20260101_000000_000000", preview.stdout
+            )
+            self.assertIn(
+                "snapshot\twould remove\tsnapshot_20260101_000000_000001", preview.stdout
+            )
+            self.assertEqual(len(list(snapshots.iterdir())), 32)
+
+            swept = self._run(env, fake_bin, "clean", "--snapshots")
+            self.assertEqual(swept.returncode, 0, swept.stderr)
+            surviving = sorted(path.name for path in snapshots.iterdir())
+            self.assertEqual(len(surviving), 30)
+            self.assertNotIn("snapshot_20260101_000000_000000", surviving)
+
+    def test_sandbox_test_command_is_isolated_and_closes_the_loop(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            tmp = env.home / "tmp"
+            tmp.mkdir()
+            result = self._run(env, fake_bin, "test", extra_env={"TMPDIR": str(tmp)})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("step\tsetup\tok", result.stdout)
+            self.assertIn("step\tplan\tok", result.stdout)
+            self.assertIn("step\tuninstall\tok", result.stdout)
+            self.assertIn("test\tok", result.stdout)
+            self.assertFalse(
+                (env.home / ".config" / "niri").exists(),
+                "the sandbox must not deploy into the caller's HOME",
+            )
+            sandbox_root = Path(result.stdout.splitlines()[0].split("\t", 1)[1])
+            self.assertFalse(sandbox_root.exists(), "a passing run cleans up after itself")
+
+    def test_sandbox_test_keeps_the_tree_when_the_repository_is_broken(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            with tempfile.TemporaryDirectory() as tmp:
+                broken = Path(tmp) / "noctalia-mod"
+                shutil.copytree(PROJECT, broken)
+                shutil.rmtree(broken / "modules" / "niri" / "files")
+                scratch = env.home / "tmp"
+                scratch.mkdir()
+
+                result = self._run(
+                    env,
+                    fake_bin,
+                    "test",
+                    cli=broken / "bin" / "noctalia-mod",
+                    extra_env={"TMPDIR": str(scratch)},
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("test\tfailed", result.stdout)
+                self.assertIn("kept for inspection", result.stdout)
+                kept = Path(result.stdout.strip().splitlines()[-1].split("\t")[-1])
+                self.assertTrue(kept.is_dir(), result.stdout)
+                shutil.rmtree(kept)
+
+    def test_update_pulls_and_redeploys_through_a_fresh_process(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                tree = tmp_path / "tree"
+                shutil.copytree(PROJECT, tree)
+                remote = tmp_path / "remote.git"
+                self._git("init", "--bare", "--initial-branch=main", str(remote), cwd=tmp_path)
+                self._git("init", "--initial-branch=main", cwd=tree)
+                self._git("add", "-A", cwd=tree)
+                self._git("commit", "-m", "one", cwd=tree)
+                self._git("remote", "add", "origin", str(remote), cwd=tree)
+                self._git("push", "-u", "origin", "main", cwd=tree)
+
+                cli = tree / "bin" / "noctalia-mod"
+                installed = self._run(env, fake_bin, "install", "niri", "--yes", cli=cli)
+                self.assertEqual(installed.returncode, 0, installed.stderr)
+                deployed = env.home / ".config" / "niri" / "animations.kdl"
+                self.assertNotIn("from upstream", deployed.read_text())
+
+                other = tmp_path / "other"
+                self._git("clone", str(remote), str(other), cwd=tmp_path)
+                animations = other / "modules" / "niri" / "files" / "animations.kdl"
+                animations.write_text(
+                    "// first upstream change\n" + animations.read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+                self._git("add", "-A", cwd=other)
+                self._git("commit", "-m", "two", cwd=other)
+                self._git("push", cwd=other)
+
+                pulled = self._run(env, fake_bin, "update", "--no-deploy", cli=cli)
+                self.assertEqual(pulled.returncode, 0, pulled.stderr)
+                self.assertIn("not redeploying (--no-deploy)", pulled.stdout)
+                self.assertNotIn("first upstream change", deployed.read_text())
+
+                animations.write_text(
+                    animations.read_text(encoding="utf-8").replace(
+                        "// first upstream change", "// second upstream change"
+                    ),
+                    encoding="utf-8",
+                )
+                self._git("add", "-A", cwd=other)
+                self._git("commit", "-m", "three", cwd=other)
+                self._git("push", cwd=other)
+
+                updated = self._run(env, fake_bin, "update", "--yes", cli=cli)
+                self.assertEqual(updated.returncode, 0, updated.stderr)
+                self.assertIn("updated:", updated.stdout)
+                self.assertIn("installed: niri", updated.stdout)
+                self.assertIn(
+                    "// second upstream change", deployed.read_text(),
+                    "the redeploy must run on the freshly pulled code",
+                )
+                head = self._git("rev-parse", "HEAD", cwd=tree).strip()[:7]
+                ledger = (
+                    env.home / ".local" / "state" / "noctalia-mod" / "modules" / "niri.state"
+                ).read_text(encoding="utf-8")
+                self.assertIn(f"source_version\t{head}", ledger)
+
+    def test_update_refuses_a_dirty_checkout_but_not_an_untracked_file(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                plain = tmp_path / "plain"
+                shutil.copytree(PROJECT, plain)
+                not_git = self._run(
+                    env, fake_bin, "update", "--no-deploy", cli=plain / "bin" / "noctalia-mod"
+                )
+                self.assertNotEqual(not_git.returncode, 0)
+                self.assertIn("not a git checkout", not_git.stderr)
+
+                tree = tmp_path / "tree"
+                shutil.copytree(PROJECT, tree)
+                self._git("init", "--initial-branch=main", cwd=tree)
+                self._git("add", "-A", cwd=tree)
+                self._git("commit", "-m", "one", cwd=tree)
+                cli = tree / "bin" / "noctalia-mod"
+                head_before = self._git("rev-parse", "HEAD", cwd=tree)
+
+                (tree / "README.md").write_text("my own edit\n", encoding="utf-8")
+                refused = self._run(env, fake_bin, "update", "--no-deploy", cli=cli)
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("uncommitted changes", refused.stderr)
+                self.assertEqual(self._git("rev-parse", "HEAD", cwd=tree), head_before)
+
+                # 未跟踪文件不是改动：它不该挡住一次更新（这里没有远端，所以停在 pull 那步）。
+                self._git("checkout", "--", "README.md", cwd=tree)
+                (tree / "scratch.txt").write_text("temporary\n", encoding="utf-8")
+                reached_pull = self._run(env, fake_bin, "update", "--no-deploy", cli=cli)
+                self.assertNotEqual(reached_pull.returncode, 0)
+                self.assertNotIn("uncommitted changes", reached_pull.stderr)
+                self.assertIn("git pull failed", reached_pull.stderr)
+
+    def test_update_non_interactive_without_yes_pulls_nothing(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp_path = Path(tmp)
+                tree = tmp_path / "tree"
+                shutil.copytree(PROJECT, tree)
+                self._git("init", "--initial-branch=main", cwd=tree)
+                self._git("add", "-A", cwd=tree)
+                self._git("commit", "-m", "one", cwd=tree)
+                head_before = self._git("rev-parse", "HEAD", cwd=tree)
+
+                refused = self._run(
+                    env, fake_bin, "update", cli=tree / "bin" / "noctalia-mod"
+                )
+                self.assertNotEqual(refused.returncode, 0)
+                self.assertIn("non-interactive update without --yes", refused.stderr)
+                self.assertEqual(
+                    self._git("rev-parse", "HEAD", cwd=tree), head_before,
+                    "a refused update must not touch the checkout",
+                )
+
+    def test_update_git_arguments_are_explicit(self) -> None:
+        with TempEnv() as env:
+            fake_bin = env.home / "fake-git-bin"
+            fake_bin.mkdir()
+            log = env.home / "git.log"
+            (fake_bin / "git").write_text(
+                "#!/usr/bin/env bash\n"
+                'printf "%s\\n" "$*" >> "$GIT_LOG"\n'
+                'for arg in "$@"; do\n'
+                "    case $arg in\n"
+                "        rev-parse)\n"
+                '            count=$(cat "$GIT_COUNT" 2>/dev/null || printf 0)\n'
+                "            count=$((count + 1))\n"
+                '            printf "%s" "$count" > "$GIT_COUNT"\n'
+                '            if ((count >= 2)); then printf "bbbbbbb\\n"; else printf "aaaaaaa\\n"; fi\n'
+                "            exit 0 ;;\n"
+                "        pull) exit 0 ;;\n"
+                "        status) exit 0 ;;\n"
+                "    esac\n"
+                "done\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            (fake_bin / "git").chmod(0o755)
+            root = env.home / "faux-root"
+            (root / ".git").mkdir(parents=True)
+
+            script = (
+                f"source {PROJECT / 'lib/common.sh'}; "
+                f"source {PROJECT / 'lib/paths.sh'}; "
+                f"source {PROJECT / 'lib/update.sh'}; "
+                f"project_root() {{ printf '%s\\n' {root}; }}; "
+                "update_pull && "
+                'printf "changed=%s old=%s new=%s\\n" "$UPDATE_CHANGED" "$UPDATE_OLD_HEAD" "$UPDATE_NEW_HEAD"'
+            )
+            result = self._lib_run(
+                env,
+                script,
+                PATH=f"{fake_bin}:{os.environ['PATH']}",
+                GIT_LOG=str(log),
+                GIT_COUNT=str(env.home / "git.count"),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("changed=yes old=aaaaaaa new=bbbbbbb", result.stdout)
+            recorded = log.read_text(encoding="utf-8")
+            self.assertIn("-C", recorded)
+            self.assertIn("status --porcelain --untracked-files=no", recorded)
+            self.assertIn(
+                "-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15 "
+                "-c http.connectTimeout=10 pull --ff-only",
+                recorded,
+                "network calls need explicit timeouts (AGENTS §4)",
+            )
+            self.assertEqual(recorded.count("rev-parse HEAD"), 2)
+
+    def test_rollback_is_a_transaction(self) -> None:
+        with TempEnv() as env:
+            fake_bin, _ = self._fake_commands(env)
+            config = env.home / ".config"
+            installed = self._run(env, fake_bin, "install", "kitty", "niri", "--yes")
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            snapshot = self._run(env, fake_bin, "snapshot", "recovery point")
+            self.assertEqual(snapshot.returncode, 0, snapshot.stderr)
+            snapshot_id = snapshot.stdout.strip().split(": ", 1)[1]
+
+            # 快照之后用户改了 kitty；niri 的恢复点故意弄坏，让恢复在中途失败。
+            # 账本顺序是 kitty 先恢复（成功），niri 后恢复（失败）。
+            kitty_conf = config / "kitty" / "kitty.conf"
+            kitty_conf.write_text("edited after the snapshot\n", encoding="utf-8")
+            state = env.home / ".local" / "state" / "noctalia-mod"
+            shutil.rmtree(state / "snapshots" / snapshot_id / "config" / "niri")
+
+            failed = self._run(env, fake_bin, "rollback", snapshot_id)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("putting the touched modules back", failed.stderr)
+            self.assertEqual(
+                kitty_conf.read_text(encoding="utf-8"),
+                "edited after the snapshot\n",
+                "a half-done restore must be rolled back, not left half-new",
+            )
+            guards = [
+                path
+                for path in (state / "snapshots").iterdir()
+                if path.name != snapshot_id
+                and "pre-restore" in (path / "meta.tsv").read_text(encoding="utf-8")
+            ]
+            self.assertTrue(guards, "the transaction must keep a pre-restore guard")
+
     def test_module_metadata_is_validated(self) -> None:
         cases = {
             "id mismatch": (

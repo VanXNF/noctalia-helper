@@ -6,6 +6,9 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P) || exit 1
 NOCTALIA_MOD_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P) || exit 1
 export NOCTALIA_MOD_ROOT
+# 自更新用它换进程重新部署：新拉下来的 lib 只有新进程才会读到（见 lib/update.sh）。
+NOCTALIA_MOD_ENTRY="$SCRIPT_DIR/${BASH_SOURCE[0]##*/}"
+export NOCTALIA_MOD_ENTRY
 
 # shellcheck source=../lib/common.sh
 source "$NOCTALIA_MOD_ROOT/lib/common.sh"
@@ -31,6 +34,14 @@ source "$NOCTALIA_MOD_ROOT/lib/wallpaper.sh"
 source "$NOCTALIA_MOD_ROOT/lib/snapshot.sh"
 # shellcheck source=../lib/reference-check.sh
 source "$NOCTALIA_MOD_ROOT/lib/reference-check.sh"
+# shellcheck source=../lib/clean.sh
+source "$NOCTALIA_MOD_ROOT/lib/clean.sh"
+# shellcheck source=../lib/doctor.sh
+source "$NOCTALIA_MOD_ROOT/lib/doctor.sh"
+# shellcheck source=../lib/sandbox.sh
+source "$NOCTALIA_MOD_ROOT/lib/sandbox.sh"
+# shellcheck source=../lib/update.sh
+source "$NOCTALIA_MOD_ROOT/lib/update.sh"
 
 usage() {
     cat <<'USAGE'
@@ -50,6 +61,11 @@ Usage:
   noctalia-mod snapshot list|delete <id>
   noctalia-mod rollback [snapshot-id]
   noctalia-mod uninstall [module ...] [--yes]
+  noctalia-mod update [--no-deploy] [--yes]
+  noctalia-mod doctor
+  noctalia-mod bug
+  noctalia-mod clean [-n] [--snapshots]
+  noctalia-mod test
   noctalia-mod status
 USAGE
 }
@@ -704,16 +720,15 @@ cmd_snapshot() {
 
 cmd_rollback() {
     [[ $# -le 1 ]] || { error 'rollback accepts at most one snapshot id'; return 2; }
-    local id=${1-} protect
+    local id=${1-}
     [[ -n $id ]] || id=$(snapshot_latest)
     [[ -n $id ]] || { error 'no snapshots are available'; return 1; }
     snapshot_exists "$id" || { error "snapshot not found: $id"; return 1; }
-    local -a modules=()
-    mapfile -t modules < <(state_enabled_modules)
-    protect=$(snapshot_create pre-rollback "before rollback to $id" "${modules[@]}") || return 1
-    snapshot_restore "$id" no
+    # 恢复是事务：失败时被改过的模块会被放回去（PLAN §10 P2），保护快照的 ID 由
+    # snapshot_restore 写在 SNAPSHOT_LAST_GUARD 里，这里拿它当退路提示。
+    snapshot_restore "$id" no || return 1
     state_append_audit rollback "$id"
-    log "restored: $id (current state saved as $protect)"
+    log "restored: $id (state before this restore is saved as ${SNAPSHOT_LAST_GUARD:-unknown})"
 }
 
 cmd_uninstall() {
@@ -742,7 +757,9 @@ cmd_uninstall() {
     for id in "${modules[@]}"; do
         snapshot=$(snapshot_for_module "$id")
         if [[ -n $snapshot ]] && snapshot_exists "$snapshot"; then
-            snapshot_restore "$snapshot" no "$id"
+            # 这里用不带事务包装的原语：卸载逐模块恢复，而单个模块的替换本身就是原子的，
+            # 不可能出现"半个模块"。为每个模块留一份保护快照只会把快照列表塞满噪音。
+            snapshot_apply "$snapshot" no "$id"
         else
             # 回滚点没了就只能删自己铺的文件，用户原来的配置恢复不了——必须说出来，
             # 不能让它静悄悄地发生（PLAN §6）。
@@ -817,6 +834,65 @@ cmd_status() {
     done < <(module_ids)
 }
 
+cmd_doctor() {
+    [[ $# -eq 0 ]] || { error 'doctor does not accept extra arguments'; return 2; }
+    doctor_run
+}
+
+cmd_bug() {
+    [[ $# -eq 0 ]] || { error 'bug does not accept extra arguments'; return 2; }
+    local path
+    path=$(bug_report_write) || { error 'could not write the diagnostic report'; return 1; }
+    state_append_audit bug-report "$path"
+    log "report written: $path"
+}
+
+cmd_clean() {
+    clean_run "$@"
+}
+
+# 沙箱部署测试：不碰真实 ~/.config，也不装包（见 lib/sandbox.sh）。
+cmd_test() {
+    [[ $# -eq 0 ]] || { error 'test does not accept extra arguments'; return 2; }
+    sandbox_run
+}
+
+# 自更新：先拉版本，再用新代码换进程重新部署（见 lib/update.sh）。
+cmd_update() {
+    local deploy=yes arg
+    UPDATE_ASSUME_YES=no
+    while (($#)); do
+        arg=$1
+        shift
+        case $arg in
+            --no-deploy) deploy=no ;;
+            --yes | --express) UPDATE_ASSUME_YES=yes ;;
+            *) error "unknown update option: $arg"; return 2 ;;
+        esac
+    done
+    # 部署那一步会走 install 的预检确认。非交互又没有 --yes 就先拒绝，别先拉下来再卡住：
+    # "拉了但没铺"是个没人想要的中间态。
+    if [[ $deploy == yes && $UPDATE_ASSUME_YES == no && ! -t 0 ]]; then
+        error 'refusing a non-interactive update without --yes (or use --no-deploy)'
+        return 1
+    fi
+    # 拉取期间持锁：这时候并发跑 install 会在同一个目录上一边 source 一边被替换。
+    with_project_lock update_pull || return 1
+    state_append_audit update "$UPDATE_OLD_HEAD..$UPDATE_NEW_HEAD"
+    if [[ $UPDATE_CHANGED == no ]]; then
+        log "already up to date: $UPDATE_NEW_HEAD"
+        return 0
+    fi
+    log "updated: $UPDATE_OLD_HEAD..$UPDATE_NEW_HEAD"
+    if [[ $deploy == no ]]; then
+        log 'not redeploying (--no-deploy)'
+        return 0
+    fi
+    # exec 必须在锁释放之后：新进程要自己拿这把锁。
+    update_reexec_install || return 1
+    return 0
+}
+
 main() {
     require_non_root || return 1
     ensure_project_dirs
@@ -836,6 +912,11 @@ main() {
         snapshot) with_project_lock cmd_snapshot "$@" ;;
         rollback) with_project_lock cmd_rollback "$@" ;;
         uninstall) with_project_lock cmd_uninstall "$@" ;;
+        update) cmd_update "$@" ;;
+        doctor) cmd_doctor "$@" ;;
+        bug) cmd_bug "$@" ;;
+        clean) with_project_lock cmd_clean "$@" ;;
+        test) cmd_test "$@" ;;
         status) cmd_status "$@" ;;
         help|-h|--help) usage ;;
         *) error "unknown command: $command"; usage; return 2 ;;

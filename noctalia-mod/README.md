@@ -61,6 +61,11 @@ noctalia-mod/bin/noctalia-mod snapshot "before edit"
 noctalia-mod/bin/noctalia-mod rollback
 noctalia-mod/bin/noctalia-mod status
 noctalia-mod/bin/noctalia-mod uninstall niri --yes
+noctalia-mod/bin/noctalia-mod doctor
+noctalia-mod/bin/noctalia-mod bug
+noctalia-mod/bin/noctalia-mod clean -n
+noctalia-mod/bin/noctalia-mod test
+noctalia-mod/bin/noctalia-mod update
 ```
 
 Eight modules are wired up: `niri`, `noctalia`, `kitty`, `fish`, `starship`,
@@ -118,6 +123,51 @@ Paths in the shipped config use two placeholders, substituted while staging: `/h
 becomes your `$HOME`, and `@XDG_PICTURES@` becomes the XDG Pictures directory (the
 wallpaper directory, the video directory, niri's `screenshot-path`). Neither placeholder
 may survive into a deployed file.
+
+## Taking care of a machine that is already set up
+
+`doctor` prints one TSV line per check — `<ok|warn|fail|info>`, the area, and what it
+saw — then a summary. It reads the ledger, recomputes fingerprints (so drift shows
+up), tries to import the Python bindings the shipped tools need, and looks at the
+state directory, the theme, the wallpapers and free space. Missing programs are
+`warn`, not `fail`: that describes the machine, not the repository. The exit code is
+1 only when something is actually broken — a deployed target that disappeared, an
+unwritable state directory, or a repository that no longer passes `check`.
+
+```bash
+noctalia-mod/bin/noctalia-mod doctor
+noctalia-mod/bin/noctalia-mod bug        # writes $XDG_STATE_HOME/noctalia-mod/bug-report-<stamp>.md
+```
+
+`bug` collects the same checks plus the ledger, the package ledger, the snapshots and
+the tail of the audit log into one Markdown file, so you can hand it to someone
+instead of describing your machine over chat.
+
+`clean` sweeps the only rubbish this project can leave behind: a staging tree from a
+deploy that was killed halfway (`.niri.noctalia-mod.build.xxxxxx` and friends, next to
+the target). `-n` previews, `--snapshots` also drops snapshots beyond the retention
+limit — never a protected recovery point. It does not touch pacman's cache, the
+journal, TRIM or orphan packages: those need root and belong to the operating system,
+not to a configuration manager.
+
+```bash
+noctalia-mod/bin/noctalia-mod clean -n
+noctalia-mod/bin/noctalia-mod clean --snapshots
+```
+
+`test` is the "would this work on a fresh machine" check. It copies nothing: it runs
+the real entry point in a throwaway `HOME` with command stand-ins on `PATH`, so the
+whole loop happens for real — `setup --yes`, a second run that has to converge to the
+same tree, a `plan` that must not report drift, and an `uninstall` that has to clear
+the ledger — while nothing installs, nothing touches your `~/.config` and no session
+is involved. On failure it keeps the sandbox directory and prints the log tail.
+
+`update` pulls this checkout with `git pull --ff-only` and then re-executes the
+freshly pulled code to redeploy the modules in the ledger. It refuses when tracked
+files are modified (untracked files are fine), refuses a non-interactive run without
+`--yes`, and `--no-deploy` stops after the pull so you can look at the diff first.
+A re-exec matters: the libraries were sourced when the process started, so the same
+process would deploy the old code.
 
 ## Drift and runtime writers
 

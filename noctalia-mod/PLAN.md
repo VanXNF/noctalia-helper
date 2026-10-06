@@ -4,18 +4,19 @@
 > 状态标记：`已完成` / `进行中` / `待办`。缺陷用 `P0`/`P1`/`P2` 标优先级。
 >
 > **权威边界**：`noctalia-mod/` 内部文档是本子项目的唯一事实源。本仓库
-> `llms-wiki/` 描述的是旧引擎 Nyxuri，不再同步子项目内容；旧引擎退役时
-> 一并作废（见 §12）。
+> `llms-wiki/` 描述的是旧引擎 Nyxuri，本子项目不维护它、也不接管它
+> （阶段 G 已取消，见 §11、§12）。
 >
 > **新会话先读 [§16 接手须知](#16-接手须知新会话先读)**
 > —— 环境事实、工作区与 Git 状态、下一步、待裁决清单、已知陷阱、
-> 以及哪些结论只是推理而非实测，都在那一节。阶段 A–D 已收口，
-> 下一步是阶段 E。
+> 以及哪些结论只是推理而非实测，都在那一节。阶段 A–E 已收口，
+> 下一步是阶段 F（系统级可选模块）。
 
 ## 0. 终极目标与定位
 
-终极目标：把配置管理能力从现有 Nyxuri 引擎中重构出来，形成独立子项目
-`noctalia-mod/`，逐步接管全部能力，最终成为唯一的配置管理实现。
+终极目标：把配置管理能力从现有 Nyxuri 引擎中重构出来，形成独立项目
+`noctalia-mod/`，它有自己的入口、模块、测试和文档，能整目录取走独立使用。
+不接管旧入口，也不要求旧引擎退役（阶段 G 取消，见 §11）。
 
 **最终用途**：装完 CachyOS 之后，先引导用户装齐必要的软件和包，再引导用户快速
 完成配置（niri + noctalia）。这条用途是硬约束，不是附属场景——它决定了能力
@@ -76,9 +77,11 @@ noctalia-mod install --yes             # 全量，非交互
 - **渐进迁移，不推倒重来**：基座先跑通安装/部署/状态/快照闭环，其余能力
   按 §11 的顺序逐块搬过来。每一步新旧可并行，可回退。
 - **子项目自包含**：代码、配置源、测试、文档都在 `noctalia-mod/` 内。
-  迁移完成后整目录可独立检出使用（可提取为独立仓库）。
+  现在整目录就能独立检出使用（可提取为独立仓库）。
 - **不背旧包袱**：不迁移 Nyxuri 的兼容别名（`nyxniri`）、历史墓碑清单和
   用户状态账本。新项目只认自己的状态。
+- **不接管旧入口**：两边各自是一条完整的路径，谁都不需要对方退役
+  （阶段 G 取消，见 §11）。
 
 目标环境：CachyOS + niri + Noctalia V5。运行时是 Bash，只用系统已有基础工具。
 模块协议不把 niri 写死为唯一窗口管理器，但第一阶段只验证上面这组环境。
@@ -93,10 +96,10 @@ noctalia-mod install --yes             # 全量，非交互
 因此它们必须有等价的行为契约和测试，不能靠"看起来一样"。基座收口（§11 阶段 A）
 就是为这件事服务的。
 
-## 1. 迁移期边界：所有权与漂移检测
+## 1. 与旧引擎的边界：所有权与漂移检测
 
-迁移期内新旧两个管理器会写同一批 `~/.config` 路径。**这是当前最大的风险**，
-必须显式处理，不能只靠目录级的"外部文件"提示。
+只要 Nyxuri 还在这台机器上服役，两个管理器就会写同一批 `~/.config` 路径。
+**这是当前最大的风险**，必须显式处理，不能只靠目录级的"外部文件"提示。
 
 问题：`noctalia-mod` 与 Nyxuri 各自持有 preset/part 状态。例如先跑
 `nyxuri preset kitty transparent`，再跑 `noctalia-mod install kitty`，
@@ -109,8 +112,9 @@ noctalia-mod install --yes             # 全量，非交互
 2. **漂移必现**：不一致时 pre-flight 打印 `drift\t<模块>\t<changed|missing>`，
    当作外部改动处理，绝不静默覆盖。
 3. **只认自己的账本**：不读取、不迁移 Nyxuri 的 `state.json`、预设目录和快照索引。
-4. **退出判据**：当 §11 阶段 A–G 的能力对等清单全部满足、且切换入口后，
-   旧引擎转为只读回退路径，随后删除。切换前不新增对旧状态的依赖。
+4. **边界不靠退役来收口**：本条的风险在两边都活着的时候就存在，处理办法就是上面
+   三条——指纹、漂移必现、不读旧状态。旧引擎退不退役是仓库根的决定，不是本子项目
+   的前置条件（阶段 G 取消，见 §11）。
 
 指纹刻意选轻：整个模块一个摘要，不做逐文件版本库。覆盖范围只包括"本项目会覆盖
 的文件"，即排除 `__custom__`、`MODULE_PRESERVE` 与 `MODULE_RUNTIME_WRITES`：
@@ -152,7 +156,11 @@ noctalia-mod/
 │   ├── theme.sh           # GTK 深浅同步（Noctalia 不做的那一半）
 │   ├── wallpaper.sh       # 壁纸部署与 managed 账本
 │   ├── reference-check.sh # 引用与程序声明的静态自洽校验
-│   └── module-loader.sh   # 模块元数据加载与校验
+│   ├── module-loader.sh   # 模块元数据加载与校验
+│   ├── doctor.sh          # 体检与 bug 诊断导出
+│   ├── clean.sh           # 暂存残渣清理与快照清理预览
+│   ├── sandbox.sh         # 沙箱部署测试（test）
+│   └── update.sh          # git 拉取与换进程重新部署
 ├── modules/
 │   └── <module>/          # 见 §3
 ├── assets/
@@ -268,8 +276,10 @@ modules/<module>/
   `parts/`）。用户预设是用户自己的内容，让仓库体检去为用户数据报错是错的取向；
   那里的悬空引用要等 `install` 部署时才暴露。
 - **shipped 工具的运行时依赖是否已声明**：`MODULE_REPO_PACKAGES` 与工具实际
-  import 之间没有自动校验。第一个实例是 noctalia 的 `import cairo`，需要
-  `python-cairo`——迁移 tools 时才暴露出来（见 §10 已修复）。
+  import 之间没有静态校验。第一个实例是 noctalia 的 `import cairo`，需要
+  `python-cairo`——迁移 tools 时才暴露出来（见 §10 已修复）。阶段 E 起 `doctor`
+  会真去 import 一次（`gi` / `cairo` / `GtkLayerShell`），缺了就会在体检里报出来；
+  但那是运行时探测，不是静态推导，覆盖不到将来新引入的 import。
 
 **没有 `hooks.sh`**（阶段 D 复评后关闭）：模块侧的收尾动作由
 `MODULE_RELOAD_COMMAND` 承担，运行时写入的文件由 `MODULE_PRESERVE` 声明，引擎级的全局
@@ -366,7 +376,9 @@ Material You 色板的输出位置（见 noctalia 模块配置），子项目只
 `color-scheme`，但既不设 `gtk-theme` 也不写 `gtk-{3,4}.0/settings.ini`，而 Brave
 一类应用的冷启动就读后者。`install` / `setup` 的收尾各跑一次，失败只警告——配置已经
 铺好了，不该因为 `gsettings` 或会话不可用就把一次成功的部署弄成失败。模式切换时的实时
-同步（旧引擎的 `theme_mode_changed` hook）留到阶段 G：那时二进制才真的在 PATH 上。
+同步（旧引擎的 `theme_mode_changed` hook）**仍然没接**：它要指向一个能执行
+`theme sync` 的命令，而这个项目没有二进制在 PATH 上（阶段 G 已取消，不做入口替换）。
+这是一条待裁决项，理由与可选做法记在 §16.6。
 
 部署时必须继续遵守：
 
@@ -447,12 +459,22 @@ Material You 色板的输出位置（见 noctalia 模块配置），子项目只
 ### 快照与回滚
 
 - 部署前自动快照；支持手动创建、列出、删除。
-- 回滚前创建当前状态保护快照。
+- **恢复是事务（`已完成`，阶段 E）**：`snapshot_restore` 在动手前先给"将要恢复的那些
+  模块"存一份 `pre-restore` 保护快照，任何一步失败就用它把已经改过的模块放回去。没有
+  这一步，恢复失败的收场是"一半新一半旧"，而账本还指着原来那个快照。保护快照的 ID
+  写在 `SNAPSHOT_LAST_GUARD` 里，`rollback` 会把它作为"撤销这次恢复"的退路打出来。
+  保护快照创建时会把**正在恢复的那个快照**钉进 prune 的保护集合
+  （`SNAPSHOT_PROTECT_EXTRA`）——它可能已经排在第 30 名之外，不钉住就会在应用之前被
+  自己的 prune 吃掉。
+- `uninstall` 走不带事务包装的 `snapshot_apply`：它逐模块恢复，而单个模块的替换本身
+  就是原子的，不可能出现"半个模块"；为每个模块留一份保护快照只会把列表塞满噪音。
 - 普通部署继承 `__custom__`；精确回滚不继承当前配置里的新 custom 内容。
 - **清理保护（`已完成`）**：清理保留 = 全部受保护快照 + 最近的 N 个普通快照。
   受保护的是：刚建好的那个、每个模块账本里的 `last_snapshot`（uninstall 的恢复
-  点）、最近一次滚回保护快照。保留排序按 `created_at`，不按 ID 字符串——ID 的
+  点）、最近一次恢复保护快照。保留排序按 `created_at`，不按 ID 字符串——ID 的
   时间戳只到秒、后缀随机，按 ID 排等于随机丢弃。
+  删与预览问的是同一个清单（`snapshot_prune_candidates`），`clean -n --snapshots`
+  看到的和真删的一模一样。
 - 快照上限 30 个，指的是**普通**快照；受保护的不计名额，宁可多留几个也不删掉
   唯一的恢复点。
 - 用户手动删掉某个恢复点时给出警告；卸载时如果恢复点已经不在，明确告知原文件
@@ -466,6 +488,9 @@ Material You 色板的输出位置（见 noctalia 模块配置），子项目只
 - 不删除 `__custom__` 内容和模块声明的 preserve 文件。
 - 不删除系统软件包（避免删掉别人共用的依赖）。
 - 结束后清理状态目录，保留审计信息。
+- **已知取舍（待裁决，见 §10 P2）**：模块账本只存一个 `last_snapshot`，每次部署都会
+  覆盖它。所以"装过一次再装一次，然后卸载"的收场是恢复到第二次部署前的样子（也就是
+  配置还在），而不是清空。旧引擎同样取 `backups[0]`，行为一致。
 
 ## 7. 依赖管理
 
@@ -543,9 +568,9 @@ aur-helper	paru
 ### 已完成
 
 - Bash 入口与模块加载器，八个模块接入。
-- 操作：`list`、`check`、`setup`、`deps`、`plan`、`install`、
-  `preset list|apply|save|edit|delete`、`part list|apply`、`snapshot`、`rollback`、
-  `uninstall`、`status`。
+- 操作：`list`、`check`、`setup`、`deps`、`plan`、`install`、`preset list|apply|save|edit|delete`、
+  `part list|apply`、`snapshot`、`rollback`、`uninstall`、`status`、`theme sync|status`、
+  `wallpapers deploy|status|remove`、`update`、`doctor`、`bug`、`clean`、`test`。
 - 用户预设：存在 `~/.config/noctalia-mod/presets/<模块>/<名字>/`，与官方预设同一套
   解析顺序（官方优先）；`save` 不带 `__custom__`、覆盖前确认、拒绝保留字与官方同名；
   `delete` / `edit` 只作用于用户预设。活跃预设消失时按 §4 的冻结/回退语义处理。
@@ -562,8 +587,6 @@ aur-helper	paru
   账本，清理只删账本内的条目；`setup` 顺手部署，`install` 不碰 `~/.config` 之外。
 - 模块协议新增 `MODULE_RUNTIME_WRITES`：运行时也会改写、但模块仍然拥有的文件
   不进指纹（kitty 的两个文件、starship 的单文件目标）。
-- 操作：`list`、`check`、`setup`、`deps`、`plan`、`install`、`preset …`、`part …`、
-  `theme`、`wallpapers`、`snapshot`、`rollback`、`uninstall`、`status`。
 - 引导入口 `setup`：依赖与配置合成一份清单、一次确认、依次跑完，无参数时默认
   核心集（niri + noctalia）；`--with <程序>` 加装模块声明过的可选程序；跑完落
   一份收尾总结（装了什么、铺到哪、怎么退）。`setup` 可重复执行并收敛。
@@ -571,12 +594,17 @@ aur-helper	paru
   授权、repo/AUR 分批安装、已装齐时零操作返回、装后复核必需程序。
 - pacman/AUR helper 的 argv 构造、pre-flight 清单、原子替换、失败恢复、
   项目锁、状态账本。
-- 自动快照、手动快照、回滚、卸载恢复，`__custom__` 与 preserve 保留。
+- 自动快照、手动快照、回滚、卸载恢复，`__custom__` 与 preserve 保留；恢复是事务
+  （阶段 E）。
 - 引用自洽校验（`check`）：配置路径 + 配置 spawn 的程序两个维度，并接入
   `plan`/`setup` 预检与 `install`/`setup` 门禁。
 - 所有权指纹与 drift 检出；项目级依赖包账本。
-- 行为测试 41 个用例，位于子项目内（`noctalia-mod/tests/`），可独立执行。
-- 与旧引擎零耦合：不读旧状态、不依赖旧入口、不修改旧 `install.sh`。
+- 运维与自更新（阶段 E）：`doctor` 体检（TSV 输出、有 fail 才非零退出）、`bug`
+  诊断导出、`clean` 只清自己的暂存残渣并可选清理快照、`test` 沙箱部署闭环、
+  `update` 拉取后换进程重新部署。四条的边界都写在 §11 阶段 E。
+- 行为测试 76 个用例，位于子项目内（`noctalia-mod/tests/`），可独立执行。
+- 与旧引擎零耦合：不读旧状态、不依赖旧入口、不修改旧 `install.sh`。子项目是
+  独立项目，不接管旧入口（§11 阶段 G 已取消）。
 
 ### 未完成 / 不实
 
@@ -588,8 +616,11 @@ aur-helper	paru
 - 没有做过新旧部署结果的隔离 HOME 对照验收。
 - 环境检查只打印信息，不阻断（现已明确为设计选择）。
 - `$XDG_RUNTIME_DIR/noctalia-mod` 从未被使用，相关函数是死代码。
+- **模式切换时的实时主题同步仍未接**：`theme sync` 只在部署收尾跑，Noctalia 自己切
+  深浅时不会通知本项目（§4、§16.6）。
 - **初始化从未在真实全新机器上验收过**：`setup` 只在隔离 HOME + 假命令下闭环，
-  实机受 `sudo` 不可用限制（见 §16.1、§16.5）。
+  实机验收要用户自己跑（agent 侧 `sudo` 不可用，见 §16.1、§16.5）。阶段 E 的 `test`
+  也没有改变这一点——它同样不装真包、不进真会话。
 
 ## 10. 已知缺陷与待办
 
@@ -734,8 +765,9 @@ pre-rollback 保护快照"，且受保护的不占 30 个名额；保留排序�
 处理方式：新增 `lib/theme.sh` 与 `theme sync` / `theme status` 两个动作，`install` 与
 `setup` 的收尾各调一次，失败只警告（配置已经铺好了，不该因为 `gsettings` 或会话不可用
 把一次成功的部署弄成失败）。旧引擎的模式解析保留（部署时没有别的办法知道当前深浅），
-flock 防抖去掉——新架构没有 CLI + hook 双触发。模式切换时的实时同步留到阶段 G
-（那时二进制才真的在 PATH 上）。回归测试：`test_theme_sync_follows_the_current_mode`、
+flock 防抖去掉——新架构没有 CLI + hook 双触发。模式切换时的实时同步仍然没接：
+hook 要指向一个能执行 `theme sync` 的命令，而本项目没有二进制在 PATH 上（§16.6 第 5 条）。
+回归测试：`test_theme_sync_follows_the_current_mode`、
 `test_theme_sync_preserves_unrelated_settings_ini_content`、
 `test_theme_status_reports_what_is_expected`、
 `test_deploy_syncs_the_theme_without_failing_the_install`。
@@ -768,6 +800,22 @@ niri 配置 include 它"的说法也不准确——`modules/niri/parts/glow/glow
 `test_wallpapers_remove_keeps_user_files_and_refuses_unsafe_entries`、
 `test_setup_deploys_wallpapers_but_install_does_not`。
 
+**回滚不是事务（已修复，阶段 E）**。`snapshot_restore` 原先逐模块恢复，中途失败就
+直接返回：已经恢复的模块留在新状态、没恢复的留在旧状态，而账本还指着原来那个快照。
+模块再多一个，这个中间态就没人说得清。
+
+处理方式：`snapshot_restore` 变成事务包装——先给"将要恢复的那些模块"存一份 `pre-restore`
+保护快照，失败就用它把已改的模块放回去；原来的逐模块循环拆成内部原语 `snapshot_apply`
+（`uninstall` 仍用它：单模块替换本身原子，不需要也不该为每个模块留一份保护快照）。
+保护快照创建时会 prune，所以正在恢复的那个快照被 `SNAPSHOT_PROTECT_EXTRA` 钉住，
+否则它可能在第 30 名之外被自己的 prune 删掉。回归测试：`test_rollback_is_a_transaction`
+（快照里一个模块的副本故意弄坏，验证另一个模块被放回去、保护快照存在）。
+
+顺带统一了两处：`snapshot_prune` 与 `clean -n --snapshots` 现在共用
+`snapshot_prune_candidates`，"预览的"和"真删的"是同一个清单；保护快照的类型名从
+`pre-rollback` 改为 `pre-restore`——现在建它的不只 `rollback`，安装/部署失败的自动
+恢复也走同一条路，`snapshot_protected_ids` 保护的仍是"最近一个"。
+
 ### 待办（余项）
 
 #### P2 其它
@@ -782,7 +830,20 @@ niri 配置 include 它"的说法也不准确——`modules/niri/parts/glow/glow
 - ~~待验证：Noctalia 的内置 kitty 模板是否会写进 `~/.config/kitty/`~~ → **已结案：
   会写，而且不止 kitty**，实测见 §10 P1-9。
 
-- `snapshot_restore` 逐模块恢复，中途失败不回滚已恢复的模块；回滚目前不是事务。
+- **重装之后卸载不删配置（未改，待裁决）**。模块账本只存一个 `last_snapshot`，
+  每次部署都覆盖它，而 `uninstall` 恢复的就是它。**实测**：连续两次
+  `install niri --yes` 之后跑 `uninstall niri --yes`，`~/.config/niri` 还在——因为
+  最近一次"部署前快照"就是第二次部署前的样子（配置已经铺好）。旧引擎取
+  `backups[0]`，行为一致，所以这不是迁移引入的回归。要改成"卸载恢复第一次部署前的
+  状态"，得在账本里多存一个 `first_snapshot`（或按模块记录首次部署时间），属于
+  schema 变更。阶段 E 没有动它：`test` 沙箱的卸载断言只验账本被清空，文件语义留给
+  这次裁决。
+
+- **`clean` 不碰系统级缓存（有意，待裁决）**。旧引擎的 `clean` 会清 pacman 包缓存、
+  vacuum journal、删孤立包、跑 TRIM，还要提权；新项目的 `clean` 只管自己的暂存残渣
+  与快照。理由：那些是操作系统维护，不是配置管理器的领地，而需要 root 的万金油命令
+  和"非交互优先 + 只动自己的东西"是冲突的。要保留这套能力的话，更适合做成一份显式
+  的系统维护清单（和 §11 阶段 F 的系统级模块同一类），而不是塞回 `clean`。
 
 ## 11. 后续迁移顺序
 
@@ -820,7 +881,7 @@ HOME 下闭环、`check` 全绿、34 个测试通过、无 P0/P1 未关闭）都
 - **环境检查语义定稿（已完成）**：目标环境缺失只提示；仓库缺陷（悬空引用、未声明
   程序）阻断部署；运行时缺必需程序只警告，因为那是这台机器的状态（§5）。
 - **初始化验收（部分）**：隔离 HOME + 假命令下端到端跑通（见 §13 隔离验收）；
-  **真实全新机器上的验收仍未做**，`sudo` 不可用，见 §16.5。
+  **真实全新机器上的验收仍未做**（agent 侧 `sudo` 不可用，见 §16.5）。
 
 阶段 B 拍板结果（原"待定交互决策"）：
 
@@ -884,19 +945,40 @@ HOME 下闭环、`check` 全绿、34 个测试通过、无 P0/P1 未关闭）都
   子项目走（`assets/wallpapers/`，1 张图），远程壁纸包下载不迁——旧引擎也只把它做成
   显式可选。只有 `setup` 会顺手部署壁纸，`install` 的契约仍是"只动 `~/.config`"。
 - **P2 里的壁纸死代码已清**：`wallpaper_picker/config.py` 那条仓库相对回退路径在任何
-  布局下都指不到东西，零行为变更地删掉（旧引擎那份源不动，随旧树一起退役）。
+  布局下都指不到东西，零行为变更地删掉（旧引擎那份源不动，那是另一棵树的事）。
 
 仍然留着的取舍：`video_directory` 与 `mpvpaper` 插件在装着的 noctalia 5.2.1 上是惰性的
 （二进制里没有这两个字符串，也没有 plugins 目录），所以不为它写特殊逻辑，但也不删——
 升级后会生效。
 
-### 阶段 E：运维与自更新
+### 阶段 E：运维与自更新（已完成）
 
-- `update`：拉取新版本 + 重新部署（新旧引擎共存期先不做自动状态迁移）。
-- `doctor` 体检与 `bug` 诊断导出。
-- `clean` 缓存清理（`-n` 预览）。
-- 沙箱部署测试入口（等价 `install.sh test`）。
-- 快照/回滚做成事务（P2 最后一条）。
+- **`update`（已完成）**：`git pull --ff-only` + 换进程重新部署账本里的模块。四条
+  边界都被测试钉住：不是 git 检出就拒绝；改了已跟踪文件就拒绝（未跟踪文件不拦）；
+  非交互又没有 `--yes` 时**先拒绝、再拉取**（不留"拉了但没铺"的中间态）；拉完必须
+  `exec` 一个新进程，因为 lib 只在入口启动时 source 过一次。网络参数带显式超时
+  （`http.lowSpeedLimit/lowSpeedTime/connectTimeout`）。**不做状态迁移**：账本 schema
+  是自包含的，没有按版本号走的迁移链可言（旧引擎那套 `migrations` 是给跨版本升级的）。
+- **`doctor` 体检（已完成）**：TSV 输出 `<状态>\t<领域>\t<说明>`，状态是
+  `ok|warn|fail|info`。十项检查：环境、仓库自洽（复用 `check` 的三个函数）、模块账本
+  与指纹、执行位、必需/可选程序、状态目录与暂存残渣、GTK 深浅、壁纸、随包 Python
+  工具的 import（就是 §3 那条"人工审计"的自动版）、磁盘空间。退出码只在有 `fail`
+  时非零——"没装这个程序"是 `warn`（那描述的是机器，不是仓库），"装着的模块目标没了"
+  才是 `fail`。
+- **`bug` 诊断导出（已完成）**：把体检、部署账本、包账本、快照列表、审计尾部收进
+  一份 Markdown，落在 `$XDG_STATE_HOME/noctalia-mod/bug-report-<时间戳>.md`。只读本项目
+  自己的状态与几个基础命令，不收集系统日志。
+- **`clean`（已完成，范围有意收窄）**：清的是本项目唯一会留下的垃圾——部署中断留下的
+  暂存树（名字精确匹配 `.<目标>.noctalia-mod.{new,old,build,uninstall}.<随机后缀>`，
+  路径必须在配置根内，软链一律跳过）。`-n` 预览与实删共用同一个清单；
+  `--snapshots` 顺带做一次快照清理（受保护的点绝不删）。**不碰 pacman 缓存、journal、
+  TRIM、孤立包**：那些要 root、属于操作系统维护，理由与去留见 §10 P2。
+- **沙箱部署测试 `test`（已完成）**：在临时 HOME + 命令替身（`pacman` 一律答"已装"，
+  于是不装包、不提权）里跑真入口：`setup --yes` → 校验模块目标与 `MODULE_VALIDATE_PATHS`
+  → 再跑一遍必须得到同一棵树、不留暂存残渣 → `plan` 不许报漂移 → `uninstall` 必须清空
+  账本。失败时保留沙箱目录并打印日志尾部。它等价于 `install.sh test`，但更严：那条
+  命令只是"在当前环境重铺一次"，这条自带隔离与收敛断言，且不会碰到真实 `~/.config`。
+- **快照/回滚做成事务（已完成）**：见 §6 与 §10 已修复。
 
 ### 阶段 F：系统级可选模块
 
@@ -904,11 +986,18 @@ HOME 下闭环、`check` 全绿、34 个测试通过、无 P0/P1 未关闭）都
 - greeter、fisher、gtktheme
 - 统一 `install|status|uninstall` 三件套契约。
 
-### 阶段 G：发布与替换
+### 阶段 G：已取消（重构后的项目是独立项目，不接管旧项目）
 
-- 打包：PKGBUILD 与依赖聚合。
-- 切换入口：让 `install.sh` 指向子项目。
-- 旧引擎退役：转为只读回退路径，随后删除，并作废 `llms-wiki/`。
+原计划是"打包 + 让 `install.sh` 指向子项目 + 退役旧引擎"。**取消**：`noctalia-mod/`
+是一个能整目录取走的独立项目，自己的入口是 `bin/noctalia-mod`，不需要替换旧入口，
+也不需要等旧引擎退役。由此：
+
+- 打包（PKGBUILD、依赖聚合）不属于本子项目的交付；真要打包，那是"独立项目的发布
+  方式"，届时单独设计，和旧引擎的去留无关。
+- 仓库根的 `install.sh`、`nyxuri/`、`configs/`、`assets/` 不归本子项目管，也不为了
+  子项目好过而改动（§14）。
+- `llms-wiki/` 继续是旧引擎的文档，本子项目不维护它（§12）。旧树哪天退役是仓库根的
+  决定，不是本子项目的前置条件。
 
 ### 明确不迁移
 
@@ -916,17 +1005,19 @@ HOME 下闭环、`check` 全绿、34 个测试通过、无 P0/P1 未关闭）都
 - Nyxuri 的 `NYXURI_*` 运行时环境变量与 `LEGACY_*` 回退分支（迁移 tools 时已删）。
 - 用户状态账本与迁移墓碑清单。
 - 自研桌面外壳路由（旧引擎的 `shell get|set`）。新项目只支持 Noctalia。
+- 旧入口的接管与旧引擎的退役（阶段 G 取消，见上）。
 
 ## 12. 文档与变更记录约定
 
 - **文档权威在子项目内**：`PLAN.md`（方案与进度）、`README.md`（用法）、
   各模块 `README.md`（协议与例外）。代码改动必须同步这里。
-- **不更新 `llms-wiki/`**：那是旧引擎的文档。迁移期内它描述的能力会逐渐转移到
-  子项目，出现不一致时以子项目文档和当前代码为准。旧引擎退役时整体作废。
+- **不更新 `llms-wiki/`**：那是旧引擎的文档，本子项目不维护它（阶段 G 取消后旧引擎
+  不会被子项目取代，两份文档各自描述各自的树）。出现不一致时以子项目文档和当前代码
+  为准。
 - **变更记录后置**：子项目在没有被真实用户使用之前，不写用户可见的 changelog。
-  迁移期不往仓库根 `CHANGELOG.md` 添加子项目条目——那条记录对用户不可感知
-  （入口未接入，也不在 PATH 上）。子项目被实际使用（阶段 G 切换入口）后，
-  在子项目内建自己的 changelog。
+  也不往仓库根 `CHANGELOG.md` 添加子项目条目——那条记录对用户不可感知（入口是
+  `bin/noctalia-mod`，不在 PATH 上，也没有自己的发布）。等它真的被日常使用，再在
+  子项目内建自己的 changelog。
 
 ## 13. 测试与验收
 
@@ -987,7 +1078,7 @@ python3 noctalia-mod/tests/test_noctalia_mod.py -q   # 直接执行同样可以
 | 引用自洽校验（悬空引用被拒） | ✅ |
 | 安装后 niri 能加载配置（`effects.kdl` 存在且可解析） | ✅ |
 | 运行时软链状态跨重部署保留 | ✅ |
-| shipped 工具的 import 与依赖声明一致 | 人工审计（无自动校验，见 §3 边界） |
+| shipped 工具的 import 与依赖声明一致 | ✅ 由 `doctor` 真去 import 一次（§11 阶段 E） |
 | 全新系统初始化闭环（§11 阶段 B） | 隔离 HOME 闭环 ✅；真实机器 ⬜ |
 | 所有权指纹与 drift 检出（managed 改动、目标消失） | ✅ |
 | drift 不误报 `__custom__` / preserve / 运行时软链改动 | ✅ |
@@ -1000,6 +1091,17 @@ python3 noctalia-mod/tests/test_noctalia_mod.py -q   # 直接执行同样可以
 | `install` 不碰 `~/.config` 之外，`setup` 才部署壁纸 | ✅ |
 | 运行时写入的文件不报漂移，但仍被部署覆盖 | ✅ |
 | `MODULE_RUNTIME_WRITES` 越界路径被元数据校验拒 | ✅ |
+| `doctor`：健康时退出 0、目标消失时 fail 且退出 1 | ✅ |
+| `doctor`：报出 drift 与暂存残渣 | ✅ |
+| `bug`：报告含账本、包账本与体检输出 | ✅ |
+| `clean`：只删自己命名的暂存项，`-n` 不删任何东西 | ✅ |
+| `clean --snapshots`：预览与实删同一清单，普通 `clean` 不动快照 | ✅ |
+| `test`：沙箱闭环、不碰调用者 HOME、成功即清理 | ✅ |
+| `test`：仓库坏掉时失败并保留沙箱目录 | ✅ |
+| `update`：拉取后换进程重铺新代码、账本版本更新 | ✅ |
+| `update`：脏树 / 非 git 检出 / 非交互无 `--yes` 被拒且不动仓库 | ✅ |
+| `update`：git argv 形状（超时参数、`--ff-only`、未跟踪文件不拦） | ✅ |
+| 回滚是事务：中途失败放回已恢复的模块，并留 `pre-restore` 保护快照 | ✅ |
 
 每步实现后至少运行（全部零网络秒级）：
 
@@ -1026,6 +1128,7 @@ shellcheck -x noctalia-mod/bin/noctalia-mod "${shells[@]}"
 
 python3 -m unittest discover -s noctalia-mod/tests -q
 noctalia-mod/bin/noctalia-mod check
+noctalia-mod/bin/noctalia-mod test        # 自带隔离，跑完整闭环（阶段 E）
 ```
 
 三个坑，都是踩过的：
@@ -1038,9 +1141,10 @@ noctalia-mod/bin/noctalia-mod check
 3. **注释不要以 `shellcheck` 开头。** 任何 `# shellcheck ...` 开头的行都会被当成
    指令解析，写中文说明时踩过一次，直接报 SC1072 语法错误。
 
-`shellcheck` 已装在 `~/.local/bin/shellcheck`（官方静态二进制 v0.11.0，容器里 sudo
-无法提权，所以没走 pacman）。子项目、`install.sh` 与旧项目的 shell 脚本当前都是
-零告警。
+`shellcheck` 现在是 pacman 装的那份（`/usr/bin/shellcheck`，包版本 `0.11.0-150`）；
+此前临时装在 `~/.local/bin` 的静态二进制已由用户移除，不再依赖它。子项目（22 个
+`*.sh` + 入口）、`install.sh` 与旧项目的 8 个 `configs/**/*.sh` 在这份包版本上复核过，
+**零告警**。
 
 > 仓库根 `AGENTS.md` §3 里的 `bash -n install.sh configs/noctalia/*.sh ...` 是同一个
 > 坑：那条命令实际只检查了 `install.sh`。已在会话里报告，未擅自改动该文件。
@@ -1059,12 +1163,17 @@ HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod rollback
 HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod uninstall niri noctalia --yes
 HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod theme status
 HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod wallpapers status
+HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod doctor
+HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod bug
+HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod clean -n
+noctalia-mod/bin/noctalia-mod test          # 自己造临时 HOME 与命令替身，不需要外面套 HOME
 ```
 
 注意这些命令需要 PATH 上能有 `pacman`、`sudo`、`xdg-user-dir`、`gsettings` 之类；
 本机实测时用假命令目录放在 PATH 前面（见 §16.5 的做法），否则 `setup --yes` 会真的去
 装包、`theme sync` 会真的动你当前的 gsettings。`theme sync` 与 `wallpapers deploy`
-是两条**会改到 `~/.config` 之外**的命令，在真机上跑之前先想清楚。
+是两条**会改到 `~/.config` 之外**的命令，在真机上跑之前先想清楚。`doctor`、`bug`、
+`clean -n` 与 `update --no-deploy` 都是只读的（`bug` 只往状态目录写一份报告）。
 
 ## 14. 会话执行约束
 
@@ -1072,7 +1181,8 @@ HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod wallpapers status
    README，然后动手。
 2. 修改前检查 `git status` 与 §16.3 的工作区状态；有未提交改动先问用户，别在脏树上动工。
 3. 对路径、状态、部署、保留规则有疑问时，全仓库检索引用后再下结论。
-4. 每步保持新旧引擎可并行运行，不修改旧 `install.sh`（阶段 G 之前）。
+4. 旧引擎与旧入口不归本子项目管：不为了子项目好过而改 `install.sh`、`nyxuri/`、
+   `configs/`、`assets/`（阶段 G 已取消，见 §11）。
 5. 每个模块独立测试，不依赖其他模块的隐式副作用。
 6. 不使用软链接写入 `~/.config`（运行时内部软链除外）。
 7. 不在安装循环里加无必要的阻断式确认。
@@ -1106,10 +1216,10 @@ HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod wallpapers status
 | 本机 | CachyOS Linux，`x86_64`，**就是目标环境** |
 | 工作目录 | `/home/victorxu/Projects/workspace/noctalia-helper` |
 | 用户 | uid 1000（`victorxu`），非 root |
-| `sudo` | **不可用**：容器设了 no-new-privileges，`sudo -v` 直接失败 |
-| `pacman` / `paru` | 都在，但因为上一条，装包路径无法实测 |
+| `sudo` | **agent 的工具沙箱里不可用**：设了 no-new-privileges，`sudo -v` 直接失败。用户自己的 shell 不受这条限制（`shellcheck` 就是他自己 `pacman -S` 装的），所以本机装包路径由用户实测，不由 agent 实测 |
+| `pacman` / `paru` | 都在。agent 侧因为上一条无法走安装路径（`deps`/`setup` 只能用假命令验证） |
 | 网络 | 通（GitHub 与 Arch 镜像均可达） |
-| `shellcheck` | `~/.local/bin/shellcheck`，v0.11.0 官方静态二进制；`~/.local/bin` 在默认 PATH 上 |
+| `shellcheck` | pacman 装的 `/usr/bin/shellcheck`（`shellcheck 0.11.0-150`）。早先临时用的 `~/.local/bin` 静态二进制已被移除，现在走包管理 |
 | `fish` | 4.9.3，在 PATH 上（fish 模块本来就要装它），所以 `fish -n` 能进语法门禁 |
 | `xdg-user-dir` / `timeout` / `gsettings` | 都在 PATH 上。前两个被 `@XDG_PICTURES@` 与各处的超时用到，`gsettings` 被 `theme sync` 用到 |
 | Git 身份 | `victor xu <vanxnf@gmail.com>`（全局已配好；此前几个提交的身份是后改的，见 §16.3） |
@@ -1117,8 +1227,8 @@ HOME=$(mktemp -d) noctalia-mod/bin/noctalia-mod wallpapers status
 | **SSH 是坏的** | `/etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf` 的符号链接目标属主成了 `nobody:nobody`，OpenSSH 的属主检查直接拒绝读配置，任何 ssh 连接都起不来。绕法：`GIT_SSH_COMMAND='ssh -F /dev/null -o ConnectTimeout=15 -o BatchMode=yes' git push …`。**没有**改那个系统文件（属于系统，不是本仓库的事） |
 | 沙箱 | 工作区之外只读；写 `~/.local/bin` 之类需要一次提权 |
 
-`shellcheck` 是后补装的（pacman 不可用，走官方 tar.xz 静态二进制），子项目、
-`install.sh` 与旧项目的 shell 脚本当前都是零告警。
+`shellcheck` 的运行前提是它在 PATH 上（包装的 `/usr/bin/shellcheck` 满足）；这条
+命令不参与任何构建，所以缺了只是门禁少一条，不影响项目本身。
 
 ### 16.2 门禁三连（每条都实测过，照抄即可）
 
@@ -1137,32 +1247,28 @@ find noctalia-mod/modules/fish -type f -name '*.fish' -print0 |
 mapfile -t shells < <(find noctalia-mod -type f -name '*.sh' | sort)
 shellcheck -x noctalia-mod/bin/noctalia-mod "${shells[@]}"
 
-# 3. 行为测试 + 仓库引用自洽
+# 3. 行为测试 + 仓库引用自洽 + 沙箱闭环
 python3 -m unittest discover -s noctalia-mod/tests -q
 noctalia-mod/bin/noctalia-mod check
+noctalia-mod/bin/noctalia-mod test
 ```
 
-当前基线：语法 17 个 shell 入口 + 随包 Python 工具 + 4 个 fish 文件全过、shellcheck
-零告警、64 个测试 OK、`check` 全绿。
+当前基线：语法 23 个 shell 文件 + 随包 Python 工具 + 4 个 fish 文件全过、shellcheck
+零告警、76 个测试 OK、`check` 全绿、`test` 闭环。
 仓库根 `discover -s tests` 也能过，但**不再覆盖子项目**（测试已迁入，见 §13）。
 
 ### 16.3 当前工作区与 Git 状态
 
-- 工作区**干净**，改动都已提交。分支 `refactor/v3`，远端 tip 是 `0634edc`。
-- **两个提交还没推上去**（`git log --oneline origin/refactor/v3..HEAD`）：
-  - `59b0779` 运行时能力：补齐 XDG 路径改写、GTK 深浅同步与壁纸部署（阶段 D）
-  - `c374dc7` 迁入剩余三个模块并补上用户预设（阶段 C）
-  要推的话记得 §16.1 那条 SSH 绕法。
-- 更早的三个提交（`0634edc` 建基座+setup、`8f59962` 首阶段、`2214f27` 方案文档）
-  已经推上去了。其中两个原本用旧身份 `Echoes678 <raydu678@gmail.com>` 提交，后来
-  按用户要求重写成 `victor xu <vanxnf@gmail.com>` 并 force-push——**任何拉过
-  `refactor/v3` 的地方都要 `git fetch --force` 后 reset**，否则会看到分叉。
-- **旧引擎仍然是活入口**：`install.sh` 走 `python3 -I -S -c … nyxuri.cli`，仓库根的
-  `nyxuri/`、`configs/`、`assets/` 都还在服役。子项目**没有**接进入口（那是阶段 G），
-  所以：
-  - 不要为了让子项目好过而改 `nyxuri/`、`configs/`、`assets/`（阶段 G 之前不动）；
-  - 子项目里那份 `assets/wallpapers/lawson_fuji.webp` 与仓库根那份暂时是重复的，
-    旧树退役时一起消失（§12）；
+- 分支 `refactor/v3`，远端 tip 与本地 HEAD 都是 `d3040fb`（阶段 E 的交接文档）。
+- **阶段 E 的改动在工作区里、还没提交**：新增 `lib/{doctor,clean,sandbox,update}.sh`，
+  改了 `bin/noctalia-mod`、`lib/snapshot.sh`、测试与两份文档。要提交的话按 §5 的
+  changelog 规矩（子项目现在**不写**用户可见 changelog，见 §12）。
+- 推远端记得 §16.1 那条 SSH 绕法（`ssh_config.d` 的属主检查坏了，任何 ssh 都起不来）。
+- **子项目是独立项目，不接管旧入口**（阶段 G 已取消，见 §11）：
+  - `install.sh`、`nyxuri/`、`configs/`、`assets/` 仍在旧引擎名下服役，本子项目
+    不为了自己好过去改它们；
+  - 子项目里那份 `assets/wallpapers/lawson_fuji.webp` 与仓库根那份是重复的，各自
+    随各自的树走，不是待清理的残留；
   - 仓库根 `CHANGELOG.md` 里子项目的条目已经撤掉，理由见 §12。
 - 仓库根 `discover -s tests`（旧引擎 471 个用例）现在是绿的；子项目的测试**不在**
   那条发现路径里，要单独跑（见 §16.2）。
@@ -1195,6 +1301,15 @@ noctalia-mod/bin/noctalia-mod check
    也不会被解析（这是想要的行为，见 §4"预设目录本身不接受软链"）。
 11. **`((${#arr[@]})) && printf …` 作函数最后一句会返回 1**，`set -e` 下把调用方带崩。
    本项目里所有"打印行"的小函数都在末尾补 `return 0`，新加同类函数照做。
+12. **单引号里的反引号会被 shellcheck 报 SC2016（info）**：Markdown 代码围栏写
+   `printf '```\n'` 就会踩到，零告警基线立刻被打破。要字面量就加
+   `# shellcheck disable=SC2016`（它作用到下一个函数整块）并写清为什么；
+   "整段内容是给别的进程的 shell 代码"那种（`test` 的命令替身）更适合用 quoted
+   heredoc，那里不报。
+13. **命令替换里写全局变量会丢**：`SNAPSHOT_LAST_GUARD` 由 `snapshot_restore` 写，
+   调用方要读它就不能写成 `x=$(snapshot_restore …)`——那是子 shell，赋值出不来。
+14. **`git status --porcelain` 默认把未跟踪文件算进"脏"**：拿它挡更新会把一个路过的
+   临时文件变成永久拦路虎，要带 `--untracked-files=no` 才是"改过已跟踪文件"。
 
 ### 16.5 哪些是实测，哪些还只是推理
 
@@ -1202,7 +1317,7 @@ noctalia-mod/bin/noctalia-mod check
 
 **实测过**：
 
-- 门禁三连（含随包 Python 与 fish 的语法）、64 个测试、`check` 全绿。
+- 门禁三连（含随包 Python 与 fish 的语法）、76 个测试、`check` 全绿、`test` 闭环。
 - 旧引擎的 471 个用例仍绿（`discover -s tests`）。
 - `deps → install → plan → snapshot → rollback → uninstall` 在假命令 + 临时 HOME 下闭环。
 - `setup --yes` 从零到配置就位并幂等复跑（树不变、无暂存残留、账本不重复）；
@@ -1225,11 +1340,23 @@ noctalia-mod/bin/noctalia-mod check
   `wallpapers remove` 只删账本条目、手写的越界账本条目被拒且 `/etc/passwd` 完好。
 - P0-1 的端到端复现、AUR helper 前置确认的顺序契约、并发锁拒绝、以 `command -v`
   为准的运行时程序核对（本机实测：必需程序全部就位，可选只缺 `ddcutil`）。
+- **阶段 E 的五条都在隔离环境里跑过**：`doctor` 在健康树上退出 0、删掉部署目标后
+  报 `fail` 且退出 1、手改受管文件与造一个暂存残渣都会被点名；`bug` 写出的报告含
+  账本、包账本、体检输出与审计尾部（本机实跑并读过一遍内容）；`clean` 的 `-n` 与
+  实删只动名字精确匹配的暂存项、放过只长得像的名字与用户文件；`test` 在沙箱里
+  走完 setup → 复跑同树 → plan 无漂移 → uninstall 清账本，且不碰调用者 HOME；
+  `update` 在本地 bare 远端上实跑过四条路径（脏树拒绝且 HEAD 不动、非交互无
+  `--yes` 先拒绝后不拉、`--no-deploy` 只拉不铺、`--yes` 换进程把新代码铺出来并
+  更新账本版本）。
+- **回滚事务的失败路径是实测的**：故意弄坏快照里一个模块的副本，验证另一个模块
+  被放回原样、`pre-restore` 保护快照存在、退出码非零（`test_rollback_is_a_transaction`）。
+- **重装后卸载不删配置是实测的**（§10 P2）：连跑两次 `install niri --yes` 再
+  `uninstall niri --yes`，`~/.config/niri` 仍在——恢复点是"第二次部署前"的样子。
 
 **未实测（只有推理或设计）**：
 
-- 真实机器上的 `deps`/`install`/`setup` 从未跑过——`sudo` 不可用，安装路径只能用
-  假命令验证。所以"全新机器上能进桌面、快捷键可用、Noctalia 正常渲染"这句结论
+- 真实机器上的 `deps`/`install`/`setup` 从未由 agent 跑过——agent 侧 `sudo` 不可用，
+  安装路径只能用假命令验证（用户自己可以装包：`shellcheck` 就是他 `pacman -S` 装的）。所以"全新机器上能进桌面、快捷键可用、Noctalia 正常渲染"这句结论
   **还没有依据**，§11 阶段 B 的初始化验收只完成到隔离 HOME 这一层。
 - **Noctalia v5.2.1 是否真会在目录缺失时静默空面板**：依据是官方文档 + 上游源码 +
   本机二进制字符串，**没有在真机 niri 会话里实跑**（调研是只读约束）。这条支撑着
@@ -1253,32 +1380,51 @@ noctalia-mod/bin/noctalia-mod check
 - 壁纸的实际观感（Noctalia 面板能不能看到离线那张）没验：那要在真会话里点开面板。
 - §3 的程序层声明（`MODULE_REQUIRED_COMMANDS` 等）是逐脚本人工审计的结果，
   不是自动推导出来的。
-- shipped 工具的 `import` 与 `MODULE_REPO_PACKAGES` 是否一致，没有自动校验
-  （见 §3 边界）；`python-cairo` 那次是人工发现的。
+- shipped 工具的 `import` 与 `MODULE_REPO_PACKAGES` 是否一致：`doctor` 会真去 import
+  一次，但那条探测只在**当前解释器**上回答"能不能 import"，不检查声明的包名对不对，
+  也不覆盖将来新引入的 import（见 §3 边界）；`python-cairo` 那次仍是人工发现的。
+- **`update` 没在真实远端上跑过**：所有验证都用本地 bare 仓库（`git pull` 的协议路径
+  一样，但认证、镜像、慢链路没验）。本机 ssh 也是坏的（§16.1），所以 https/ssh 两种
+  远端都只是"参数按旧引擎那套写的"。
+- **`doctor` 的几项判断是启发式的**：`gsettings` 拿不到值时报 `warn`（不算 `fail`）、
+  磁盘阈值写死 10 GiB、`XDG_CURRENT_DESKTOP` 用子串匹配 `niri`；这些都不是契约。
+- **`clean` 的暂存命名匹配靠正则**：`.<名字>.noctalia-mod.{new,old,build,uninstall}.<6+ 位>`。
+  如果将来 `deploy.sh` 起了新的暂存前缀而没同步这个正则，残渣就会留在盘上（不会误删，
+  只是清不掉）。
 
 ### 16.6 下一步与待裁决
 
 **阶段 A（基座收口）、B（全新系统初始化闭环的代码部分）、C（内容侧补齐）、
-D（运行时能力）都已完成**，逐阶段的交付与理由见 §11。下一步是
-**阶段 E：运维与自更新**：
+D（运行时能力）、E（运维与自更新）都已完成**，逐阶段的交付与理由见 §11。
+**阶段 G 已取消**：重构后的项目是独立项目，不接管旧入口，也不需要旧引擎退役
+（§11 阶段 G）。下一步是 **阶段 F：系统级可选模块**：
 
-- `update`：拉取新版本 + 重新部署（新旧引擎共存期先不做自动状态迁移）。
-- `doctor` 体检与 `bug` 诊断导出（旧引擎那套在 `nyxuri/doctor.py`，可以对着抄检查项，
-  但不要照抄它的单文件结构）。
-- `clean` 缓存清理（`-n` 预览）。
-- 沙箱部署测试入口（等价 `install.sh test`）。
-- 快照/回滚做成事务（§10 P2 最后一条）。
+- fcitx5（含"部署素材"与"设为默认"解耦；旧引擎那套 `post_install = "模块:函数"` 要
+  重新设计，见 §3 末尾）
+- greeter、fisher、gtktheme
+- 统一 `install|status|uninstall` 三件套契约。
 
 已拍板的决定散在 §11 各阶段末尾，**别再翻案**；阶段 D 的四项（占位符修法、主题同步
-触发时机、运行时写入的建模、壁纸范围）连同实测证据在 §10 P1-7…P1-9 有完整说明。
+触发时机、运行时写入的建模、壁纸范围）连同实测证据在 §10 P1-7…P1-9 有完整说明，
+阶段 E 的五项（`doctor` 的退出码语义与检查面、`bug` 只收自己的状态、`clean` 只清自己
+的残渣、`test` 的沙箱边界、`update` 不做状态迁移）在 §11 阶段 E。
 
-仍然开着的两项，都要用户拍板，不要自己动：
+要用户拍板的几项，不要自己动：
 
 1. 仓库根 `AGENTS.md` §3 的 `bash -n install.sh configs/.../*.sh` 多文件写法（只检查了
    第一个文件）。要不要一并修掉？见 §16.4 陷阱一。
-2. **真实机器上的初始化验收**什么时候做、在什么环境下做？容器里 `sudo` 不可用
+2. **真实机器上的初始化验收**什么时候做、在什么环境下做？agent 侧 `sudo` 不可用
    （§16.1），所以"全新系统能进桌面、快捷键可用、Noctalia 正常渲染"至今仍是推理。
-   阶段 E 的沙箱部署测试入口解决不了这一条——它不装真包、不进真会话。
+   阶段 E 的 `test` 解决不了这一条——它不装真包、不进真会话。
+3. **重装之后卸载不删配置**（§10 P2）：要不要在账本里多存一个 `first_snapshot`，
+   让 `uninstall` 恢复"本项目第一次动它之前"的状态？
+4. **`clean` 的系统级缓存清理要不要保留**（§10 P2）：旧引擎那套 pacman/journal/TRIM
+   现在没有对应物。要做的话更适合放进阶段 F 的系统级模块，而不是塞回 `clean`。
+5. **模式切换时的实时主题同步怎么接**（§4）：它要指向一个能执行 `theme sync` 的命令，
+   而现在这个项目没有二进制在 PATH 上。可选做法：(a) 随 noctalia 模块提供一个
+   `theme-sync.sh`，它找 PATH 上的 `noctalia-mod`，找不到就静默退出（等于在没上 PATH
+   的机器上不生效）；(b) 干脆不接，靠每次部署收尾同步；(c) 先把 `bin/` 放进 PATH
+   这件事定下来再接 hook——那已经是"发布方式"，不属于子项目内部。
 
 开工前的固定动作：`git status` 看树、按 §16.2 跑门禁三连建基线、读本节的
 §16.1–§16.5，然后才动手。

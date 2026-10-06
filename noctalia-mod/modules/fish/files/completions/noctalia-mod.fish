@@ -1,9 +1,12 @@
 # Completion for the standalone noctalia-mod configuration manager.
 
-complete -c noctalia-mod -f -n "__fish_use_subcommand" -a "list check setup deps plan install preset part theme wallpapers snapshot rollback uninstall status"
+complete -c noctalia-mod -f -n "__fish_use_subcommand" -a "list check setup deps plan install preset part theme wallpapers snapshot rollback uninstall update doctor bug clean test status"
 complete -c noctalia-mod -f -n "__fish_seen_subcommand_from setup deps plan install uninstall" -a "(noctalia-mod list | string split -f1 \t)"
-complete -c noctalia-mod -f -n "__fish_seen_subcommand_from setup deps install uninstall" -l yes -d "Confirm the checklist without asking"
+complete -c noctalia-mod -f -n "__fish_seen_subcommand_from setup deps install uninstall update" -l yes -d "Confirm the checklist without asking"
 complete -c noctalia-mod -f -n "__fish_seen_subcommand_from setup" -l with -d "Also install a declared optional program"
+complete -c noctalia-mod -f -n "__fish_seen_subcommand_from update" -l no-deploy -d "Pull only; do not redeploy"
+complete -c noctalia-mod -f -n "__fish_seen_subcommand_from clean" -l dry-run -d "Preview without deleting"
+complete -c noctalia-mod -f -n "__fish_seen_subcommand_from clean" -l snapshots -d "Also drop snapshots past the retention limit"
 complete -c noctalia-mod -f -n "__fish_seen_subcommand_from theme" -a "sync status"
 complete -c noctalia-mod -f -n "__fish_seen_subcommand_from wallpapers" -a "deploy status remove"
 complete -c noctalia-mod -f -n "__fish_seen_subcommand_from snapshot" -a "list delete"
